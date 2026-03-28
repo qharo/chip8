@@ -1,0 +1,17 @@
+[project]
+name = "chip8-transformer"
+version = "0.1.0"
+description = "CHIP-8 CPU emulator implemented as a transformer with 2D attention"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+    "scipy",
+    "pygame>=2.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]

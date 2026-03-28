@@ -1,0 +1,395 @@
+CHIP-8 Transformer Emulator — Project Summary
+===============================================
+
+Overview
+--------
+A transformer that emulates a CHIP-8 CPU using 2D attention heads. Each of the
+128 attention heads operates on 2-dimensional key/query vectors, enabling
+O(log N) inference via convex hull lookup of the nearest key to each query.
+
+Project Structure
+-----------------
+chip8/
+├── emulator/           # CHIP-8 CPU implementation
+│   ├── cpu.py          # Fetch-decode-execute loop, all 35 opcodes
+│   ├── memory.py       # 4KB RAM with font data at 0x000
+│   ├── display.py      # 64×32 monochrome framebuffer, XOR sprite drawing
+│   ├── keypad.py       # 16-key hex keypad input
+│   └── tracer.py       # Converts execution to token trace strings
+├── data/               # Data pipeline
+│   ├── tokenizer.py    # Custom ~370-token vocabulary (no BPE)
+│   ├── generator.py    # Random ROM generation + fuzzing
+│   └── dataset.py      # PyTorch Dataset with sliding window
+├── model/              # Transformer architecture
+│   ├── config.py       # ModelConfig with device-aware defaults
+│   ├── attention.py    # 2D attention: CUDA fast path + MPS/CPU chunked path
+│   ├── transformer.py  # Full causal transformer with KV-cache generation
+│   └── hardmax.py      # Standalone hardmax attention functions
+├── hull/               # O(log N) inference optimization
+│   └── kv_cache.py     # Convex hull KV-cache using scipy.spatial.ConvexHull
+├── train.py            # Training loop with temperature annealing
+├── generate.py         # Game runner (headless or pygame)
+├── .gitignore
+├── pyproject.toml
+└── requirements.txt
+
+===============================================================================
+PHASE 1: CHIP-8 Emulator
+===============================================================================
+
+emulator/memory.py
+------------------
+- 4096-byte RAM (bytearray)
+- Font data loaded at 0x000: digits 0-F as 4×5 pixel sprites (80 bytes)
+- Methods: load_rom(), read_byte(), write_byte(), read_word(), read_range(),
+  snapshot() (returns non-zero address/value pairs)
+
+emulator/display.py
+-------------------
+- 64×32 monochrome framebuffer (list of lists)
+- clear(), get_pixel(), xor_pixel(), draw_sprite()
+- Sprites are XOR'd onto display; collision detection returns True if any
+  pixel was turned off (used for VF flag in DRW instruction)
+- Sprite wrapping at screen edges (COSMAC VIP behavior)
+
+emulator/keypad.py
+------------------
+- 16-key state (0x0-0xF)
+- press(), release(), is_pressed(), any_pressed()
+
+emulator/cpu.py
+---------------
+- All 35 CHIP-8 opcodes implemented with COSMAC VIP quirks:
+  - 8XY1/8XY2/8XY3: VF reset to 0 after OR/AND/XOR
+  - 8XY6/8XYE: Shift VY, not VX (original COSMAC behavior)
+  - FX55/FX65: I increments during load/store
+- CPUState dataclass: V[0..15], I, PC, SP, stack[16], DT, ST
+- step() returns trace dict: {pc, opcode, mnemonic, writes}
+- Seeded RNG for reproducible random (CXNN instruction)
+- Waiting-for-key state for FX0A (blocks until key pressed)
+
+emulator/tracer.py
+------------------
+- format_trace_line(): Converts trace dict to string:
+  [PC:0200] [FETCH:6005] [OP:LD_VX_NN] [W_V0:05] [W_PC:0202]
+- format_mem_snapshot(): <MEM_START> <0200:60> ... <MEM_END>
+- format_reg_snapshot(): <REG_START> <V0:00> ... <PC:0200> ... <REG_END>
+- generate_trace(): Runs CPU for N cycles, produces list of trace lines
+
+===============================================================================
+PHASE 2: Custom Tokenizer
+===============================================================================
+
+data/tokenizer.py
+-----------------
+- NOT BPE. Every concept is one discrete token.
+- Vocabulary (370 tokens total):
+  - <PAD>: Padding token (ID 0)
+  - <00>-<FF>: 256 hex byte tokens
+  - <V0>-<VF>: 16 register name tokens
+  - <PC>, <I>, <DT>, <ST>, <SP>: Special register tokens
+  - <PC:>, <FETCH:>, <OP:>: Trace label tokens
+  - <W_V0>-<W_VF>, <W_I>, <W_PC>, <W_DT>, <W_ST>, <W_SP>, <W_MEM:>,
+    <W_DISPLAY>: Write label tokens
+  - 34 opcode mnemonics: <CLS>, <RET>, <JP_ADDR>, <LD_VX_NN>, etc.
+  - Control tokens: <MEM_START>, <MEM_END>, <REG_START>, <REG_END>,
+    <TRACE_START>, <SEP>, <ADDR:>, <VAL:>
+  - Keypad tokens: <KEY_0>-<KEY_F>, <KEY_UP>, <KEY_DOWN>, etc., <NO_KEY>
+  - Structural: [, ], :
+
+- encode_line(): Parses bracket notation [PC:0200] and angle brackets
+  <0200:60> into flat token ID lists
+- decode(): Token IDs back to string
+- encode_trace(): Encodes full list of trace lines into flat token IDs
+
+===============================================================================
+PHASE 3: Data Generation
+===============================================================================
+
+data/generator.py
+-----------------
+- 33 opcode generator functions, each producing 2-byte CHIP-8 instructions
+- Weighted random opcode selection (LD_VX_NN and DRW weighted higher)
+- generate_random_rom(): Creates ROMs with N random valid instructions
+- generate_traces_from_rom(): Runs ROM through emulator, captures traces
+- generate_dataset(): Mixed dataset from random ROMs (fuzzing) + real ROMs
+  from a directory. Each ROM trace separated by <SEP> token.
+- Real ROM loading via load_rom_file()
+
+data/dataset.py
+---------------
+- TraceDataset: PyTorch Dataset
+- Takes flat token ID list, creates sliding windows of seq_len+1
+- X = tokens[0:seq_len], Y = tokens[1:seq_len+1] (next-token prediction)
+- Pads short sequences with pad_id
+
+===============================================================================
+PHASE 4: Model Architecture
+===============================================================================
+
+model/config.py
+---------------
+- ModelConfig dataclass:
+  - vocab_size=370, d_model=256, n_heads=128, d_head=2
+  - n_layers=6, d_ff=1024, max_seq_len=512, dropout=0.1
+  - use_checkpoint=True (gradient checkpointing for memory savings)
+  - temp_start=10.0, temp_end=0.01 (temperature annealing range)
+- detect_device(): Returns cuda > mps > cpu
+- for_device(): Auto-selects seq_len and checkpoint based on device:
+  - CUDA 24GB+: seq_len=1024, no checkpoint
+  - CUDA <24GB: seq_len=512, checkpoint
+  - MPS: seq_len=512, checkpoint
+  - CPU: seq_len=256, checkpoint
+
+model/attention.py
+------------------
+- Attention2D: Core 2D attention module
+  - 128 heads, each with d_head=2 (2D key/query/value vectors)
+  - W_q, W_k, W_v: Linear(d_model → d_model) projections
+  - W_o: Output projection
+  - Causal mask (upper triangular)
+
+  forward() routes to three paths based on device and mode:
+
+  1. CUDA fast path (_cuda_attention):
+     - Full parallel: single matmul over all 128 heads
+     - (B, 128, T, T) score matrix — fits in 24GB+ VRAM
+     - Uses F.scaled_dot_product_attention (Flash Attention) when available
+     - Falls back to manual softmax for temperature != 1.0
+
+  2. CUDA hardmax path (_cuda_hardmax):
+     - Full parallel argmax over all heads
+
+  3. MPS/CPU chunked path (_chunked_softmax):
+     - Processes heads in chunks (dynamic chunk size based on B, T)
+     - Each chunk: reshape to (B*chunk, T, d_head), use bmm
+     - Peak memory: B * chunk_size * T * T * 4 bytes
+     - Pre-allocated output tensor, writes each chunk directly
+
+  4. MPS/CPU hardmax path (_chunked_hardmax):
+     - Same chunked strategy but with argmax
+
+  forward_step(): Single-token autoregressive step with KV-cache
+    - Q, K, V for new token, append to cache
+    - Full parallel (seq_len=1 at inference is always cheap)
+
+  ~5M total parameters (weight-tied embeddings)
+
+model/transformer.py
+--------------------
+- TransformerBlock:
+  - Pre-norm: LayerNorm → Attention → residual → LayerNorm → FFN → residual
+  - FFN: Linear(256→1024) → GELU → Linear(1024→256) → Dropout
+  - forward_step() for autoregressive generation
+
+- Chip8Transformer:
+  - token_emb: Embedding(vocab_size, d_model)
+  - pos_emb: Embedding(max_seq_len, d_model)
+  - 6 TransformerBlocks
+  - ln_f: Final LayerNorm
+  - head: Linear(d_model, vocab_size) — weight-tied with token_emb
+  - Gradient checkpointing via torch.utils.checkpoint during training
+
+  generate():
+  - Prefill: processes entire prompt, builds KV cache per layer
+  - Autoregressive: one token at a time with KV cache
+  - Greedy decoding (argmax)
+
+model/hardmax.py
+----------------
+- hardmax_attention_step(): Single query, find nearest key by dot product
+- hardmax_attention_full(): Full sequence hardmax with causal mask
+
+===============================================================================
+PHASE 5: Convex Hull KV-Cache
+===============================================================================
+
+hull/kv_cache.py
+----------------
+- ConvexHullKVCache:
+  - Stores raw K, V tensors (list of per-step tensors)
+  - Per-head 2D point lists and scipy ConvexHull
+  - append(): Adds new K/V, rebuilds hull for each of 128 heads
+  - query_hardmax(): Queries only hull vertices (O(V) where V << N)
+  - Hull reduction: 20 points → 5-8 vertices typical for random 2D data
+
+- StandardKVCache: Baseline cache that queries all keys (O(N))
+
+Key insight: For 2D vectors, the maximum dot product Q·K occurs at a vertex
+of the convex hull of the key points. This reduces attention from O(N) to
+O(V) where V is hull vertex count.
+
+===============================================================================
+PHASE 6: Training
+===============================================================================
+
+train.py
+--------
+- Auto device detection: CUDA > MPS > CPU
+- CUDA info: prints GPU name and VRAM
+- Data pipeline: generate → tokenize → dataset → train/val split
+
+- Temperature annealing (exponential decay):
+  τ(step) = temp_start * (temp_end / temp_start) ^ (step / total_steps)
+  Starts at 10.0 (soft, near-uniform attention)
+  Ends at 0.01 (sharp, near-argmax → prepares for hardmax inference)
+
+- Mixed precision (CUDA only):
+  - torch.autocast with bfloat16
+  - GradScaler (no-op for bf16, active for fp16)
+  - Auto-disabled on MPS/CPU
+
+- torch.compile (CUDA only):
+  - Applied when CUDA detected
+  - 20-40% speedup, skipped if unavailable
+
+- Gradient checkpointing:
+  - Enabled on MPS/CPU (trades compute for memory)
+  - Disabled on CUDA (memory not the bottleneck)
+
+- Optimizer: AdamW (lr=1e-4, weight_decay=0.01)
+- Scheduler: Linear warmup + cosine decay
+- Gradient clipping: max_norm=1.0
+- Cross-entropy loss ignoring pad tokens
+- Logs: loss, accuracy, temperature, LR, tokens/sec
+- Saves best model (by val_loss) + periodic checkpoints
+
+CLI arguments:
+  --device, --cpu           Device selection
+  --num-roms (500)          Random ROMs for fuzzing
+  --inst-per-rom (64)       Instructions per ROM
+  --cycles-per-rom (2000)   Execution cycles per ROM
+  --seq-len (512)           Sequence length
+  --d-model (256)           Model dimension
+  --n-heads (128)           Number of attention heads
+  --n-layers (6)            Transformer layers
+  --d-ff (1024)             FFN dimension
+  --batch-size (8)          Batch size
+  --lr (1e-4)               Learning rate
+  --epochs (20)             Training epochs
+  --temp-start (10.0)       Initial temperature
+  --temp-end (0.01)         Final temperature
+  --no-amp                  Disable mixed precision
+  --no-compile              Disable torch.compile
+  --no-checkpoint           Disable gradient checkpointing
+  --output-dir (checkpoints) Checkpoint directory
+
+===============================================================================
+PHASE 7: Game Runner
+===============================================================================
+
+generate.py
+------------
+- Loads trained model from checkpoint
+- Loads ROM (.ch8 file) or generates random ROM
+- Builds initial prompt from memory snapshot + register state + <TRACE_START>
+- Autoregressive generation with hardmax attention
+
+- Headless mode:
+  - Generates trace tokens, prints decoded output
+
+- Display mode (pygame):
+  - 64×32 display scaled 10× (640×320 window)
+  - Standard CHIP-8 keypad mapping (1-4, QWER, ASDF, ZXCV)
+  - Keypad input injected as <KEY_X> tokens
+  - Parses generated tokens for display updates
+  - Token buffer trimmed to last 2048 tokens to prevent unbounded growth
+  - 60 FPS target, ~10 cycles per frame (~600 Hz)
+
+===============================================================================
+DEVICE-SPECIFIC BEHAVIOR
+===============================================================================
+
+MPS (Apple Silicon, ~9GB unified memory):
+  - Attention: Chunked heads via bmm (dynamic chunk size)
+  - Gradient checkpointing: Enabled (recomputes forward activations)
+  - Default seq_len: 512
+  - Default batch_size: 8
+  - Precision: float32
+  - No torch.compile
+
+CUDA (24-48GB VRAM):
+  - Attention: Full parallel across all 128 heads
+  - Flash Attention via F.scaled_dot_product_attention (auto)
+  - Gradient checkpointing: Disabled
+  - Default seq_len: 1024
+  - Default batch_size: 32+
+  - Precision: bfloat16 mixed precision
+  - torch.compile enabled
+
+CPU:
+  - Attention: Same chunked path as MPS
+  - Gradient checkpointing: Enabled
+  - Default seq_len: 256
+  - Default batch_size: 4-8
+  - Precision: float32
+  - Very slow, mainly for debugging
+
+===============================================================================
+TRAINING RESULTS (MPS, tiny test)
+===============================================================================
+
+Config: d_model=64, n_heads=32, d_head=2, n_layers=2, seq_len=128, 98K params
+Dataset: 50 random ROMs, 500 cycles each, ~358K tokens
+
+Epoch 1: loss=2.26, acc=54.89%
+Epoch 2: loss=0.91, acc=71.04%
+Epoch 3: loss=0.80, acc=74.78%
+
+Temperature annealing visible in logs: 10.0 → 0.01 over training.
+Accuracy rises as temperature drops (attention sharpens toward hardmax).
+
+===============================================================================
+DEPENDENCIES
+===============================================================================
+
+torch>=2.0          # Core framework
+numpy               # Array operations
+scipy               # ConvexHull for KV-cache optimization
+pygame>=2.5         # Display/keyboard for game runner
+
+===============================================================================
+USAGE
+===============================================================================
+
+# Train on MPS (Mac)
+python3 train.py --num-roms 500 --epochs 20 --batch-size 8
+
+# Train on CUDA
+python3 train.py --num-roms 500 --epochs 20 --batch-size 32 --seq-len 1024
+
+# Quick test
+python3 train.py --num-roms 50 --epochs 3 --d-model 64 --n-heads 32 --n-layers 2
+
+# Run trained model (headless)
+python3 generate.py checkpoints/best_model.pt --random-rom --headless
+
+# Run with display
+python3 generate.py checkpoints/best_model.pt --rom game.ch8
+
+===============================================================================
+FILES CREATED
+===============================================================================
+
+emulator/__init__.py      (empty)
+emulator/memory.py        (68 lines)
+emulator/display.py       (42 lines)
+emulator/keypad.py        (21 lines)
+emulator/cpu.py           (245 lines)
+emulator/tracer.py        (79 lines)
+data/__init__.py          (empty)
+data/tokenizer.py         (167 lines)
+data/generator.py         (175 lines)
+data/dataset.py           (39 lines)
+model/__init__.py         (empty)
+model/config.py           (52 lines)
+model/attention.py        (220 lines)
+model/transformer.py      (202 lines)
+model/hardmax.py          (53 lines)
+hull/__init__.py          (empty)
+hull/kv_cache.py          (122 lines)
+train.py                  (260 lines)
+generate.py               (210 lines)
+pyproject.toml            (13 lines)
+requirements.txt          (5 lines)
+.gitignore                (9 lines)

@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Virtual environments
+.venv/
+
+# Training artifacts
+checkpoints/
+*.pt
+*.pth
+
+# ROM files (user-supplied)
+*.ch8
+*.rom
+
+# macOS
+.DS_Store
