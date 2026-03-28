@@ -1,0 +1,8 @@
+nohup: ignoring input
+W0328 18:35:18.344000 129455335793280 torch/_dynamo/convert_frame.py:762] [0/8] torch._dynamo hit config.cache_size_limit (8)
+W0328 18:35:18.344000 129455335793280 torch/_dynamo/convert_frame.py:762] [0/8]    function: 'forward' (/root/chip8/model/transformer.py:101)
+W0328 18:35:18.344000 129455335793280 torch/_dynamo/convert_frame.py:762] [0/8]    last reason: L['temperature'] == 10.0                                    
+W0328 18:35:18.344000 129455335793280 torch/_dynamo/convert_frame.py:762] [0/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+W0328 18:35:18.344000 129455335793280 torch/_dynamo/convert_frame.py:762] [0/8] To diagnose recompilation issues, see https://pytorch.org/docs/main/torch.compiler_troubleshooting.html.
+/usr/local/lib/python3.11/dist-packages/torch/utils/checkpoint.py:1399: FutureWarning: `torch.cpu.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cpu', args...)` instead.
+  with device_autocast_ctx, torch.cpu.amp.autocast(**cpu_autocast_kwargs), recompute_context:  # type: ignore[attr-defined]

@@ -93,32 +93,47 @@ class Attention2D(nn.Module):
     def _cuda_attention(self, Q: torch.Tensor, K: torch.Tensor,
                         V: torch.Tensor, T: int,
                         temperature: float) -> torch.Tensor:
-        """Full parallel attention on CUDA. (B, n_heads, T, T) score matrix
-        fits in 24GB+ VRAM."""
-        # Try Flash Attention via scaled_dot_product_attention
-        # Flash Attention doesn't support custom temperature, so we
-        # fall back to manual if temperature != 1.0
-        if temperature == 1.0:
-            try:
-                mask_bool = self.causal_mask[:T, :T]
-                out = F.scaled_dot_product_attention(
-                    Q, K, V,
-                    attn_mask=mask_bool,
-                    dropout_p=self.attn_dropout.p if self.training else 0.0,
-                    is_causal=False,  # we pass the mask explicitly
-                )
-                return out
-            except Exception:
-                pass
+        """Full parallel attention on CUDA using Flash Attention."""
+        
+        # --- THE FLASH ATTENTION HACK ---
+        # 1. SDPA requires d_head to be a multiple of 8. Our d_head=2 silently triggers 
+        #    a fallback to Math attention, causing a 16GB Memory Bomb!
+        # 2. SDPA divides by sqrt(d_head) natively, so we must correct the scale.
+        # 3. Custom masks disable Flash Attention, so we use is_causal=True instead.
+        
+        pad_size = 16 - self.d_head
+        
+        # SDPA will automatically divide the scores by sqrt(16). 
+        # We want it divided by our original scale (sqrt(2)) AND the temperature.
+        # We fix this by pre-multiplying Q by the exact mathematical difference:
+        scale_correction = math.sqrt(16) / (self.scale * temperature)
+        Q_scaled = Q * scale_correction
+        
+        # Pad from 2D to 16D with zeros. (Mathematically identical dot products)
+        Q_pad = F.pad(Q_scaled, (0, pad_size))
+        K_pad = F.pad(K, (0, pad_size))
+        V_pad = F.pad(V, (0, pad_size))
+        
+        try:
+            # is_causal=True natively handles the triangle mask inside the Flash kernel!
+            out_pad = F.scaled_dot_product_attention(
+                Q_pad, K_pad, V_pad,
+                attn_mask=None,
+                dropout_p=self.attn_dropout.p if self.training else 0.0,
+                is_causal=True,
+            )
+            # Slice the 14 zeros off the end to return perfectly to d_head=2
+            return out_pad[..., :self.d_head]
+            
+        except Exception:
+            # Absolute fallback (Should never be reached now)
+            scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.scale * temperature)
+            mask_expanded = self.causal_mask[:T, :T].unsqueeze(0).unsqueeze(0)
+            scores = scores.masked_fill(mask_expanded, float("-inf"))
+            attn_weights = F.softmax(scores, dim=-1)
+            attn_weights = self.attn_dropout(attn_weights)
+            return torch.matmul(attn_weights, V)
 
-        # Manual attention
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
-        scores = scores / temperature
-        mask_expanded = self.causal_mask[:T, :T].unsqueeze(0).unsqueeze(0)
-        scores = scores.masked_fill(mask_expanded, float("-inf"))
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.attn_dropout(attn_weights)
-        return torch.matmul(attn_weights, V)
 
     def _cuda_hardmax(self, Q: torch.Tensor, K: torch.Tensor,
                       V: torch.Tensor, T: int) -> torch.Tensor:

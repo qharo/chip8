@@ -10,10 +10,12 @@ import argparse
 import math
 import os
 import time
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
+from tqdm import tqdm
 
 from data.tokenizer import Tokenizer
 from data.generator import generate_dataset
@@ -48,7 +50,7 @@ def train(args):
     print(f"Device: {device}")
     if is_cuda:
         gpu_name = torch.cuda.get_device_properties(0).name
-        vram_gb = torch.cuda.get_device_properties(0).total_mem / 1e9
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
         print(f"GPU: {gpu_name} ({vram_gb:.0f} GB)")
     print(f"Mixed precision: {use_amp} (dtype={amp_dtype})")
 
@@ -100,7 +102,7 @@ def train(args):
         max_seq_len=seq_len,
         dropout=args.dropout,
         pad_token_id=tokenizer.pad_id,
-        use_checkpoint=args.checkpoint and not is_cuda,
+        use_checkpoint=args.checkpoint,
         temp_start=args.temp_start,
         temp_end=args.temp_end,
     )
@@ -136,21 +138,47 @@ def train(args):
     # Mixed precision scaler (not needed for bfloat16, but for safety)
     scaler = torch.amp.GradScaler(enabled=use_amp and amp_dtype == torch.float16)
 
-    # 6. Training loop
+    # 6. Resume from checkpoint
+    global_step = 0
+    start_epoch = 0
+    best_val_loss = float("inf")
+
+    if args.resume:
+        ckpt_path = args.resume
+        if ckpt_path == "latest":
+            step_ckpts = sorted(Path(args.output_dir).glob("checkpoint_step*.pt"))
+            if step_ckpts:
+                ckpt_path = str(step_ckpts[-1])
+            else:
+                ckpt_path = os.path.join(args.output_dir, "final_model.pt")
+
+        if os.path.exists(ckpt_path):
+            checkpoint = torch.load(ckpt_path, map_location=device)
+            model.load_state_dict(checkpoint["model_state_dict"])
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            if "scheduler_state_dict" in checkpoint:
+                scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            start_epoch = checkpoint.get("epoch", 0)
+            global_step = checkpoint.get("global_step", 0)
+            best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+            print(f"Resumed from {ckpt_path} (epoch {start_epoch}, step {global_step})")
+        else:
+            print(f"Checkpoint not found: {ckpt_path}, starting fresh")
+
+    # 7. Training loop
     loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_id)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    global_step = 0
-    best_val_loss = float("inf")
-
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         epoch_loss = 0
         epoch_correct = 0
         epoch_total = 0
-        t_epoch = time.time()
 
-        for batch_idx, (x, y) in enumerate(train_loader):
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}",
+                    leave=True, dynamic_ncols=True)
+        t_epoch = time.time()
+        for batch_idx, (x, y) in enumerate(pbar):
             x, y = x.to(device), y.to(device)
 
             # Current temperature
@@ -162,7 +190,8 @@ def train(args):
             # Mixed precision forward
             with torch.autocast(device_type=device.type,
                                 dtype=amp_dtype, enabled=use_amp):
-                logits = model(x, temperature=temp)
+                temp_tensor = torch.tensor(temp, device=device, dtype=torch.float32)
+                logits = model(x, temperature=temp_tensor)
                 loss = loss_fn(logits.view(-1, config.vocab_size), y.view(-1))
 
             # Backward (with scaler for fp16, no-op for bf16)
@@ -184,12 +213,26 @@ def train(args):
             epoch_total += total
             global_step += 1
 
-            if batch_idx % args.log_every == 0:
-                lr = optimizer.param_groups[0]["lr"]
-                acc = correct / max(total, 1) * 100
-                print(f"  Epoch {epoch+1} [{batch_idx}/{len(train_loader)}] "
-                      f"loss={loss.item():.4f} acc={acc:.1f}% "
-                      f"temp={temp:.4f} lr={lr:.2e}")
+            # Update progress bar
+            lr = optimizer.param_groups[0]["lr"]
+            acc = correct / max(total, 1) * 100
+            pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.1f}%",
+                             temp=f"{temp:.3f}", lr=f"{lr:.1e}",
+                             step=global_step)
+
+            # Step-based checkpoint
+            if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
+                pbar.write(f"  Saved checkpoint at step {global_step}")
+                save_path = os.path.join(args.output_dir, f"checkpoint_step{global_step}.pt")
+                torch.save({
+                    "config": config,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "best_val_loss": best_val_loss,
+                }, save_path)
 
         train_loss = epoch_loss / len(train_loader)
         train_acc = epoch_correct / max(epoch_total, 1) * 100
@@ -202,7 +245,8 @@ def train(args):
         with torch.no_grad():
             with torch.autocast(device_type=device.type,
                                 dtype=amp_dtype, enabled=use_amp):
-                for x, y in val_loader:
+                for x, y in tqdm(val_loader, desc="  Validating",
+                                 leave=False, dynamic_ncols=True):
                     x, y = x.to(device), y.to(device)
                     logits = model(x, temperature=config.temp_end)
                     loss = loss_fn(logits.view(-1, config.vocab_size), y.view(-1))
@@ -230,6 +274,7 @@ def train(args):
                 "config": config,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
                 "epoch": epoch,
                 "global_step": global_step,
                 "val_loss": val_loss,
@@ -244,8 +289,10 @@ def train(args):
                 "config": config,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
                 "epoch": epoch,
                 "global_step": global_step,
+                "best_val_loss": best_val_loss,
             }, save_path)
 
     # Save final model
@@ -253,8 +300,11 @@ def train(args):
     torch.save({
         "config": config,
         "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
         "epoch": args.epochs,
         "global_step": global_step,
+        "best_val_loss": best_val_loss,
     }, save_path)
     print(f"\nTraining complete. Best val_loss={best_val_loss:.4f}")
 
@@ -307,6 +357,12 @@ def main():
     parser.add_argument("--output-dir", type=str, default="checkpoints")
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--save-every", type=int, default=5)
+    parser.add_argument("--save-every-steps", type=int, default=100,
+                        help="Save checkpoint every N steps (0 to disable)")
+
+    # Resume
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint to resume from, or 'latest' to auto-find")
 
     args = parser.parse_args()
 

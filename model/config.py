@@ -18,7 +18,7 @@ class ModelConfig:
     max_seq_len: int = 512
     dropout: float = 0.1
     pad_token_id: int = 0
-    use_checkpoint: bool = True   # gradient checkpointing (MPS/CPU)
+    use_checkpoint: bool = True   # gradient checkpointing
 
     # Temperature annealing
     temp_start: float = 10.0
@@ -40,7 +40,7 @@ class ModelConfig:
     def for_device(cls, device: torch.device, **kwargs) -> "ModelConfig":
         """Create config with device-appropriate defaults.
 
-        CUDA (24GB+): seq_len=1024, no checkpointing, full parallel attention
+        CUDA (24GB+): seq_len=1024, checkpointing, full parallel attention
         MPS (9GB):    seq_len=512,  checkpointing, chunked attention
         CPU:          seq_len=256,  checkpointing, chunked attention
         """
@@ -48,9 +48,9 @@ class ModelConfig:
         if device.type == "cuda":
             vram_gb = torch.cuda.get_device_properties(0).total_mem / 1e9
             if vram_gb >= 40:
-                defaults = {"max_seq_len": 1024, "use_checkpoint": False}
+                defaults = {"max_seq_len": 1024, "use_checkpoint": True}
             elif vram_gb >= 20:
-                defaults = {"max_seq_len": 1024, "use_checkpoint": False}
+                defaults = {"max_seq_len": 1024, "use_checkpoint": True}
             else:
                 defaults = {"max_seq_len": 512, "use_checkpoint": True}
         elif device.type == "mps":

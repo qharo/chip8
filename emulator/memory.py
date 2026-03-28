@@ -52,6 +52,6 @@ class Memory:
     def read_range(self, start: int, length: int) -> list[int]:
         return [self.ram[(start + i) & 0xFFF] for i in range(length)]
 
-    def snapshot(self) -> list[tuple[int, int]]:
-        """Return list of (addr, value) for all non-zero bytes."""
-        return [(addr, val) for addr, val in enumerate(self.ram) if val != 0]
+    def snapshot(self, start_addr: int = 0x200) -> list[tuple[int, int]]:
+        """Return list of (addr, value) for non-zero bytes from start_addr onward."""
+        return [(addr, val) for addr, val in enumerate(self.ram) if val != 0 and addr >= start_addr]

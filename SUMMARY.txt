@@ -42,7 +42,8 @@ emulator/memory.py
 - 4096-byte RAM (bytearray)
 - Font data loaded at 0x000: digits 0-F as 4×5 pixel sprites (80 bytes)
 - Methods: load_rom(), read_byte(), write_byte(), read_word(), read_range(),
-  snapshot() (returns non-zero address/value pairs)
+  snapshot(start_addr=0x200) (returns non-zero address/value pairs from
+  start_addr onward; skips font region to save tokens)
 
 emulator/display.py
 -------------------
@@ -72,7 +73,7 @@ emulator/tracer.py
 ------------------
 - format_trace_line(): Converts trace dict to string:
   [PC:0200] [FETCH:6005] [OP:LD_VX_NN] [W_V0:05] [W_PC:0202]
-- format_mem_snapshot(): <MEM_START> <0200:60> ... <MEM_END>
+- format_mem_snapshot(): <MEM_START> <0200:60> ... <MEM_END> (skips 0x000-0x1FF)
 - format_reg_snapshot(): <REG_START> <V0:00> ... <PC:0200> ... <REG_END>
 - generate_trace(): Runs CPU for N cycles, produces list of trace lines
 
@@ -135,9 +136,9 @@ model/config.py
   - use_checkpoint=True (gradient checkpointing for memory savings)
   - temp_start=10.0, temp_end=0.01 (temperature annealing range)
 - detect_device(): Returns cuda > mps > cpu
-- for_device(): Auto-selects seq_len and checkpoint based on device:
-  - CUDA 24GB+: seq_len=1024, no checkpoint
-  - CUDA <24GB: seq_len=512, checkpoint
+- for_device(): Auto-selects seq_len, checkpoint enabled on all devices:
+  - CUDA 24GB+: seq_len=1024, checkpoint
+  - CUDA <24GB: seq_len=1024, checkpoint
   - MPS: seq_len=512, checkpoint
   - CPU: seq_len=256, checkpoint
 
@@ -244,22 +245,28 @@ train.py
   - 20-40% speedup, skipped if unavailable
 
 - Gradient checkpointing:
-  - Enabled on MPS/CPU (trades compute for memory)
-  - Disabled on CUDA (memory not the bottleneck)
+  - Enabled on all devices (CUDA, MPS, CPU)
+  - Essential for long sequences (seq_len >= 1024) to avoid OOM
+  - Can be disabled with --no-checkpoint
 
 - Optimizer: AdamW (lr=1e-4, weight_decay=0.01)
 - Scheduler: Linear warmup + cosine decay
 - Gradient clipping: max_norm=1.0
 - Cross-entropy loss ignoring pad tokens
-- Logs: loss, accuracy, temperature, LR, tokens/sec
-- Saves best model (by val_loss) + periodic checkpoints
+- Progress bars via tqdm: shows loss, acc, temp, lr, step per batch
+- Checkpointing:
+  - Saves best model (by val_loss)
+  - Step-based checkpoints every --save-every-steps (default 100)
+  - Epoch-based checkpoints every --save-every epochs (default 5)
+  - All checkpoints include model, optimizer, scheduler, epoch, global_step, best_val_loss
+  - Resume from any checkpoint with --resume <path> or --resume latest
 
 CLI arguments:
   --device, --cpu           Device selection
   --num-roms (500)          Random ROMs for fuzzing
   --inst-per-rom (64)       Instructions per ROM
   --cycles-per-rom (2000)   Execution cycles per ROM
-  --seq-len (512)           Sequence length
+  --seq-len (512)           Sequence length (use 2048 for long context)
   --d-model (256)           Model dimension
   --n-heads (128)           Number of attention heads
   --n-layers (6)            Transformer layers
@@ -273,6 +280,9 @@ CLI arguments:
   --no-compile              Disable torch.compile
   --no-checkpoint           Disable gradient checkpointing
   --output-dir (checkpoints) Checkpoint directory
+  --save-every-steps (100)  Save checkpoint every N steps (0 to disable)
+  --save-every (5)          Save checkpoint every N epochs
+  --resume                  Path to checkpoint or 'latest' to auto-find
 
 ===============================================================================
 PHASE 7: Game Runner
@@ -311,7 +321,7 @@ MPS (Apple Silicon, ~9GB unified memory):
 CUDA (24-48GB VRAM):
   - Attention: Full parallel across all 128 heads
   - Flash Attention via F.scaled_dot_product_attention (auto)
-  - Gradient checkpointing: Disabled
+  - Gradient checkpointing: Enabled (critical for seq_len >= 1024)
   - Default seq_len: 1024
   - Default batch_size: 32+
   - Precision: bfloat16 mixed precision
@@ -347,6 +357,7 @@ torch>=2.0          # Core framework
 numpy               # Array operations
 scipy               # ConvexHull for KV-cache optimization
 pygame>=2.5         # Display/keyboard for game runner
+tqdm                # Progress bars for training
 
 ===============================================================================
 USAGE
@@ -357,6 +368,15 @@ python3 train.py --num-roms 500 --epochs 20 --batch-size 8
 
 # Train on CUDA
 python3 train.py --num-roms 500 --epochs 20 --batch-size 32 --seq-len 1024
+
+# Train on CUDA with long context (2048 tokens)
+python3 train.py --num-roms 500 --epochs 20 --batch-size 8 --seq-len 2048
+
+# Resume training from latest checkpoint
+python3 train.py --resume latest --seq-len 2048 --batch-size 8
+
+# Resume from specific checkpoint
+python3 train.py --resume checkpoints/checkpoint_step500.pt
 
 # Quick test
 python3 train.py --num-roms 50 --epochs 3 --d-model 64 --n-heads 32 --n-layers 2
@@ -372,7 +392,7 @@ FILES CREATED
 ===============================================================================
 
 emulator/__init__.py      (empty)
-emulator/memory.py        (68 lines)
+emulator/memory.py        (57 lines)
 emulator/display.py       (42 lines)
 emulator/keypad.py        (21 lines)
 emulator/cpu.py           (245 lines)
@@ -382,13 +402,13 @@ data/tokenizer.py         (167 lines)
 data/generator.py         (175 lines)
 data/dataset.py           (39 lines)
 model/__init__.py         (empty)
-model/config.py           (52 lines)
+model/config.py           (62 lines)
 model/attention.py        (220 lines)
 model/transformer.py      (202 lines)
 model/hardmax.py          (53 lines)
 hull/__init__.py          (empty)
 hull/kv_cache.py          (122 lines)
-train.py                  (260 lines)
+train.py                  (378 lines)
 generate.py               (210 lines)
 pyproject.toml            (13 lines)
 requirements.txt          (5 lines)
