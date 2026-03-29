@@ -24,14 +24,17 @@ from model.config import ModelConfig
 from model.transformer import Chip8Transformer
 
 
+
+
 def get_temperature(step: int, total_steps: int, temp_start: float,
                     temp_end: float) -> float:
-    """Exponential temperature decay from temp_start to temp_end."""
-    if total_steps <= 0:
+    """Reach temp_end at 75% of training, then stay there."""
+    cooldown_step = int(total_steps * 0.75)
+    if step >= cooldown_step:
         return temp_end
-    ratio = min(step / total_steps, 1.0)
-    return temp_start * (temp_end / temp_start) ** ratio
 
+    ratio = step / cooldown_step
+    return temp_start * (temp_end / temp_start) ** ratio
 
 def get_device(args) -> torch.device:
     if args.cpu:
