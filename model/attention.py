@@ -1,7 +1,7 @@
 """2D attention with temperature annealing and Rotary Position Embeddings (RoPE)."""
 
 from __future__ import annotations
-
+import torch._dynamo
 import math
 
 import torch
@@ -100,22 +100,21 @@ class Attention2D(nn.Module):
         out = self.resid_dropout(out)
         return out
 
-
+    @torch._dynamo.disable
     def _cuda_attention(self, Q: torch.Tensor, K: torch.Tensor,
                         V: torch.Tensor, T: int,
-                        temperature: float) -> torch.Tensor:
+                        temperature: torch.Tensor) -> torch.Tensor:
         """Full parallel attention on CUDA using Flash Attention."""
         
         pad_size = 16 - self.d_head
         scale_correction = math.sqrt(16) / (self.scale * temperature)
         Q_scaled = Q * scale_correction
         
-        # Pad from 2D to 16D with zeros.
-        Q_pad = F.pad(Q_scaled, (0, pad_size))
-        K_pad = F.pad(K, (0, pad_size))
-        V_pad = F.pad(V, (0, pad_size))
+        # Pad and FORCE contiguity (Flash Attention strictly requires this to avoid Math fallback)
+        Q_pad = F.pad(Q_scaled, (0, pad_size)).contiguous()
+        K_pad = F.pad(K, (0, pad_size)).contiguous()
+        V_pad = F.pad(V, (0, pad_size)).contiguous()
         
-        # Call Flash Attention directly (No try/except block so torch.compile doesn't allocate fallback memory!)
         out_pad = F.scaled_dot_product_attention(
             Q_pad, K_pad, V_pad,
             attn_mask=None,
@@ -124,7 +123,8 @@ class Attention2D(nn.Module):
         )
         
         # Slice the 14 zeros off the end to return perfectly to d_head=2
-        return out_pad[..., :self.d_head]
+        return out_pad[..., :self.d_head].contiguous()
+   
 
     def _cuda_hardmax(self, Q: torch.Tensor, K: torch.Tensor,
                       V: torch.Tensor, T: int) -> torch.Tensor:
