@@ -13,15 +13,22 @@ class TraceDataset(Dataset):
 
     Each sample is a window of `seq_len + 1` tokens.
     Input X = tokens[0:seq_len], Target Y = tokens[1:seq_len+1].
+
+    Args:
+        token_ids: Flat list of token IDs.
+        seq_len: Window length (input sequence length).
+        stride: Step between window starts. Default seq_len//4 for 75% overlap.
+        pad_id: Padding token ID.
     """
 
     def __init__(self, token_ids: list[int], seq_len: int = 1024,
-                 pad_id: int = 0):
+                 stride: int | None = None, pad_id: int = 0):
         self.seq_len = seq_len
+        self.stride = stride if stride is not None else max(1, seq_len // 4)
         self.pad_id = pad_id
 
-        # Pre-compute all valid starting positions
-        self.starts = list(range(0, len(token_ids) - seq_len, seq_len))
+        # Pre-compute all valid starting positions with overlap
+        self.starts = list(range(0, len(token_ids) - seq_len, self.stride))
 
         # Store as tensor for fast indexing
         self.data = torch.tensor(token_ids, dtype=torch.long)

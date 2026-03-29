@@ -218,6 +218,17 @@ def generate_random_rom(rng: random.Random, num_instructions: int = 64) -> bytes
     return bytes(rom)
 
 
+def _inject_key_events(rng: random.Random, cpu, lines: list[str], cycle: int):
+    """Randomly inject key press/release events during trace generation."""
+    if rng.random() < 0.05:  # 5% chance to press a key
+        key = rng.randint(0, 15)
+        cpu.keypad.press(key)
+        lines.append(f"<KEY_{key:X}>")
+    elif rng.random() < 0.03:  # 3% chance to release all keys
+        cpu.keypad.reset()
+        lines.append("<NO_KEY>")
+
+
 def load_rom_file(path: str) -> bytes:
     """Load a .ch8 ROM file."""
     with open(path, "rb") as f:
@@ -227,33 +238,65 @@ def load_rom_file(path: str) -> bytes:
 def generate_traces_from_rom(rom: bytes, seed: int = 42,
                               max_cycles: int = 2000,
                               snapshot_interval: int = 200) -> list[str]:
-    """Run a ROM and generate trace lines."""
+    """Run a ROM and generate trace lines with keyboard injection."""
     cpu = CPU(seed=seed)
     cpu.load_rom(rom)
+
+    def _key_fn(lines, cycle):
+        _inject_key_events(random.Random(seed + cycle), cpu, lines, cycle)
+
     return generate_trace(cpu, max_cycles=max_cycles,
-                          snapshot_interval=snapshot_interval)
+                          snapshot_interval=snapshot_interval,
+                          key_event_fn=_key_fn)
+
+
+def generate_rom_trace(rom: bytes, rng: random.Random,
+                       cycles: int = 2000,
+                       snapshot_interval: int = 200) -> list[str]:
+    """Generate a single ROM's trace (for per-ROM train/val splitting)."""
+    rom_seed = rng.randint(0, 2**31)
+    lines = generate_traces_from_rom(rom, seed=rom_seed,
+                                     max_cycles=cycles,
+                                     snapshot_interval=snapshot_interval)
+    lines.append("<SEP>")
+    return lines
 
 
 def generate_dataset(num_random_roms: int = 500,
                      instructions_per_rom: int = 64,
                      cycles_per_rom: int = 2000,
                      rom_dir: str | None = None,
-                     seed: int = 42) -> list[str]:
+                     seed: int = 42,
+                     per_rom: bool = False):
     """Generate a mixed dataset of traces from random ROMs and real ROMs.
 
-    Returns a flat list of all trace lines concatenated.
+    Args:
+        per_rom: If True, return list[list[str]] (one list per ROM).
+                 If False, return flat list[str] (backward compatible).
+
+    Returns:
+        list[str] if per_rom=False, list[list[str]] if per_rom=True.
     """
     rng = random.Random(seed)
-    all_lines = []
+    rom_traces = []
 
-    # Random ROMs (fuzzing)
+    # Random ROMs (fuzzing) — each ROM gets its own seeded RNG
     for i in range(num_random_roms):
-        rom = generate_random_rom(rng, instructions_per_rom)
+        # Per-ROM RNG: unique seed derived from master seed + index
+        rom_rng = random.Random(seed + i * 7919)
+
+        # Variable ROM characteristics
+        inst_count = rom_rng.randint(16, 256)
+        cycle_count = rom_rng.randint(500, 5000)
+        snap_interval = rom_rng.choice([100, 200, 500, 0])
+
+        rom = generate_random_rom(rom_rng, inst_count)
         rom_seed = rng.randint(0, 2**31)
         lines = generate_traces_from_rom(rom, seed=rom_seed,
-                                         max_cycles=cycles_per_rom)
-        all_lines.extend(lines)
-        all_lines.append("<SEP>")  # separator between ROM traces
+                                         max_cycles=cycle_count,
+                                         snapshot_interval=snap_interval)
+        lines.append("<SEP>")
+        rom_traces.append(lines)
 
     # Real ROMs if directory provided
     if rom_dir and os.path.isdir(rom_dir):
@@ -263,8 +306,11 @@ def generate_dataset(num_random_roms: int = 500,
                 rom = load_rom_file(path)
                 rom_seed = rng.randint(0, 2**31)
                 lines = generate_traces_from_rom(rom, seed=rom_seed,
-                                                 max_cycles=cycles_per_rom)
-                all_lines.extend(lines)
-                all_lines.append("<SEP>")
+                                                 max_cycles=cycles_per_rom,
+                                                 snapshot_interval=200)
+                lines.append("<SEP>")
+                rom_traces.append(lines)
 
-    return all_lines
+    if per_rom:
+        return rom_traces
+    return [line for trace in rom_traces for line in trace]

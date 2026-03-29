@@ -1,0 +1,3014 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+data/
+  __init__.py
+  dataset.py
+  generator.py
+  tokenizer.py
+emulator/
+  __init__.py
+  cpu.py
+  display.py
+  keypad.py
+  memory.py
+  tracer.py
+hull/
+  __init__.py
+  kv_cache.py
+model/
+  __init__.py
+  attention.py
+  config.py
+  hardmax.py
+  transformer.py
+.gitignore
+generate.py
+pyproject.toml
+requirements.txt
+SUMMARY.txt
+train.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="data/dataset.py">
+"""PyTorch Dataset for CHIP-8 traces."""
+
+from __future__ import annotations
+
+import torch
+from torch.utils.data import Dataset
+
+from data.tokenizer import Tokenizer
+
+
+class TraceDataset(Dataset):
+    """Tokenized trace sequences for next-token prediction.
+
+    Each sample is a window of `seq_len + 1` tokens.
+    Input X = tokens[0:seq_len], Target Y = tokens[1:seq_len+1].
+    """
+
+    def __init__(self, token_ids: list[int], seq_len: int = 1024,
+                 pad_id: int = 0):
+        self.seq_len = seq_len
+        self.pad_id = pad_id
+
+        # Pre-compute all valid starting positions
+        self.starts = list(range(0, len(token_ids) - seq_len, seq_len))
+
+        # Store as tensor for fast indexing
+        self.data = torch.tensor(token_ids, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.starts)
+
+    def __getitem__(self, idx):
+        start = self.starts[idx]
+        chunk = self.data[start:start + self.seq_len + 1]
+
+        # Pad if necessary
+        if len(chunk) < self.seq_len + 1:
+            padding = torch.full((self.seq_len + 1 - len(chunk),),
+                                 self.pad_id, dtype=torch.long)
+            chunk = torch.cat([chunk, padding])
+
+        x = chunk[:self.seq_len]
+        y = chunk[1:self.seq_len + 1]
+        return x, y
+</file>
+
+<file path="data/generator.py">
+"""Data generator: produces training traces from ROMs and fuzzing."""
+
+from __future__ import annotations
+
+import os
+import random
+import struct
+from pathlib import Path
+
+from emulator.cpu import CPU
+from emulator.tracer import generate_trace
+
+# Classic CHIP-8 ROMs (common free ROMs)
+# We'll generate synthetic ROMs since we don't have ROM files yet.
+# Users can drop real .ch8 files into the roms/ directory.
+
+OPCODE_TEMPLATES = [
+    # (generator_func_name, weight)
+    ("gen_cls", 2),
+    ("gen_ret", 2),
+    ("gen_jp", 5),
+    ("gen_call", 3),
+    ("gen_se_vx_nn", 5),
+    ("gen_sne_vx_nn", 5),
+    ("gen_se_vx_vy", 4),
+    ("gen_ld_vx_nn", 10),
+    ("gen_add_vx_nn", 8),
+    ("gen_ld_vx_vy", 5),
+    ("gen_or_vx_vy", 3),
+    ("gen_and_vx_vy", 3),
+    ("gen_xor_vx_vy", 3),
+    ("gen_add_vx_vy", 5),
+    ("gen_sub_vx_vy", 4),
+    ("gen_shr_vx_vy", 2),
+    ("gen_subn_vx_vy", 2),
+    ("gen_shl_vx_vy", 2),
+    ("gen_sne_vx_vy", 4),
+    ("gen_ld_i_addr", 5),
+    ("gen_jp_v0_addr", 2),
+    ("gen_rnd_vx_nn", 3),
+    ("gen_drw", 8),
+    ("gen_skp", 2),
+    ("gen_sknp", 2),
+    ("gen_ld_vx_dt", 2),
+    ("gen_ld_dt_vx", 3),
+    ("gen_ld_st_vx", 2),
+    ("gen_add_i_vx", 3),
+    ("gen_ld_f_vx", 3),
+    ("gen_ld_b_vx", 2),
+    ("gen_ld_i_vx", 3),
+    ("gen_ld_vx_i", 3),
+]
+
+
+def gen_cls(rng: random.Random) -> bytes:
+    return bytes([0x00, 0xE0])
+
+def gen_ret(rng: random.Random) -> bytes:
+    return bytes([0x00, 0xEE])
+
+def gen_jp(rng: random.Random) -> bytes:
+    addr = rng.randint(0x200, 0xFFF)
+    return bytes([0x10 | ((addr >> 8) & 0xF), addr & 0xFF])
+
+def gen_call(rng: random.Random) -> bytes:
+    addr = rng.randint(0x200, 0xFFF)
+    return bytes([0x20 | ((addr >> 8) & 0xF), addr & 0xFF])
+
+def gen_se_vx_nn(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    nn = rng.randint(0, 255)
+    return bytes([0x30 | x, nn])
+
+def gen_sne_vx_nn(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    nn = rng.randint(0, 255)
+    return bytes([0x40 | x, nn])
+
+def gen_se_vx_vy(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    y = rng.randint(0, 15)
+    return bytes([0x50 | x, (y << 4) | 0x0])
+
+def gen_ld_vx_nn(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    nn = rng.randint(0, 255)
+    return bytes([0x60 | x, nn])
+
+def gen_add_vx_nn(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    nn = rng.randint(0, 255)
+    return bytes([0x70 | x, nn])
+
+def gen_ld_vx_vy(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    y = rng.randint(0, 15)
+    return bytes([0x80 | x, (y << 4) | 0x0])
+
+def gen_or_vx_vy(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    y = rng.randint(0, 15)
+    return bytes([0x80 | x, (y << 4) | 0x1])
+
+def gen_and_vx_vy(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    y = rng.randint(0, 15)
+    return bytes([0x80 | x, (y << 4) | 0x2])
+
+def gen_xor_vx_vy(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    y = rng.randint(0, 15)
+    return bytes([0x80 | x, (y << 4) | 0x3])
+
+def gen_add_vx_vy(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    y = rng.randint(0, 15)
+    return bytes([0x80 | x, (y << 4) | 0x4])
+
+def gen_sub_vx_vy(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    y = rng.randint(0, 15)
+    return bytes([0x80 | x, (y << 4) | 0x5])
+
+def gen_shr_vx_vy(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    y = rng.randint(0, 15)
+    return bytes([0x80 | x, (y << 4) | 0x6])
+
+def gen_subn_vx_vy(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    y = rng.randint(0, 15)
+    return bytes([0x80 | x, (y << 4) | 0x7])
+
+def gen_shl_vx_vy(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    y = rng.randint(0, 15)
+    return bytes([0x80 | x, (y << 4) | 0xE])
+
+def gen_sne_vx_vy(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    y = rng.randint(0, 15)
+    return bytes([0x90 | x, (y << 4) | 0x0])
+
+def gen_ld_i_addr(rng: random.Random) -> bytes:
+    addr = rng.randint(0x000, 0xFFF)
+    return bytes([0xA0 | ((addr >> 8) & 0xF), addr & 0xFF])
+
+def gen_jp_v0_addr(rng: random.Random) -> bytes:
+    addr = rng.randint(0x200, 0xFFF)
+    return bytes([0xB0 | ((addr >> 8) & 0xF), addr & 0xFF])
+
+def gen_rnd_vx_nn(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    nn = rng.randint(0, 255)
+    return bytes([0xC0 | x, nn])
+
+def gen_drw(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    y = rng.randint(0, 15)
+    n = rng.randint(1, 15)
+    return bytes([0xD0 | x, (y << 4) | n])
+
+def gen_skp(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    return bytes([0xE0 | x, 0x9E])
+
+def gen_sknp(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    return bytes([0xE0 | x, 0xA1])
+
+def gen_ld_vx_dt(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    return bytes([0xF0 | x, 0x07])
+
+def gen_ld_dt_vx(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    return bytes([0xF0 | x, 0x15])
+
+def gen_ld_st_vx(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    return bytes([0xF0 | x, 0x18])
+
+def gen_add_i_vx(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    return bytes([0xF0 | x, 0x1E])
+
+def gen_ld_f_vx(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    return bytes([0xF0 | x, 0x29])
+
+def gen_ld_b_vx(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    return bytes([0xF0 | x, 0x33])
+
+def gen_ld_i_vx(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    return bytes([0xF0 | x, 0x55])
+
+def gen_ld_vx_i(rng: random.Random) -> bytes:
+    x = rng.randint(0, 15)
+    return bytes([0xF0 | x, 0x65])
+
+
+GENERATORS = {name: globals()[name] for name, _ in OPCODE_TEMPLATES}
+WEIGHTS = [w for _, w in OPCODE_TEMPLATES]
+
+
+def generate_random_rom(rng: random.Random, num_instructions: int = 64) -> bytes:
+    """Generate a random ROM with valid opcodes."""
+    gen_names = [name for name, _ in OPCODE_TEMPLATES]
+    rom = bytearray()
+
+    for _ in range(num_instructions):
+        gen_name = rng.choices(gen_names, weights=WEIGHTS, k=1)[0]
+        opcode_bytes = GENERATORS[gen_name](rng)
+        rom.extend(opcode_bytes)
+
+    return bytes(rom)
+
+
+def load_rom_file(path: str) -> bytes:
+    """Load a .ch8 ROM file."""
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def generate_traces_from_rom(rom: bytes, seed: int = 42,
+                              max_cycles: int = 2000,
+                              snapshot_interval: int = 200) -> list[str]:
+    """Run a ROM and generate trace lines."""
+    cpu = CPU(seed=seed)
+    cpu.load_rom(rom)
+    return generate_trace(cpu, max_cycles=max_cycles,
+                          snapshot_interval=snapshot_interval)
+
+
+def generate_dataset(num_random_roms: int = 500,
+                     instructions_per_rom: int = 64,
+                     cycles_per_rom: int = 2000,
+                     rom_dir: str | None = None,
+                     seed: int = 42) -> list[str]:
+    """Generate a mixed dataset of traces from random ROMs and real ROMs.
+
+    Returns a flat list of all trace lines concatenated.
+    """
+    rng = random.Random(seed)
+    all_lines = []
+
+    # Random ROMs (fuzzing)
+    for i in range(num_random_roms):
+        rom = generate_random_rom(rng, instructions_per_rom)
+        rom_seed = rng.randint(0, 2**31)
+        lines = generate_traces_from_rom(rom, seed=rom_seed,
+                                         max_cycles=cycles_per_rom)
+        all_lines.extend(lines)
+        all_lines.append("<SEP>")  # separator between ROM traces
+
+    # Real ROMs if directory provided
+    if rom_dir and os.path.isdir(rom_dir):
+        for fname in sorted(os.listdir(rom_dir)):
+            if fname.endswith(".ch8") or fname.endswith(".rom"):
+                path = os.path.join(rom_dir, fname)
+                rom = load_rom_file(path)
+                rom_seed = rng.randint(0, 2**31)
+                lines = generate_traces_from_rom(rom, seed=rom_seed,
+                                                 max_cycles=cycles_per_rom)
+                all_lines.extend(lines)
+                all_lines.append("<SEP>")
+
+    return all_lines
+</file>
+
+<file path="data/tokenizer.py">
+"""Custom CHIP-8 tokenizer. No BPE — every concept is one token."""
+
+from __future__ import annotations
+
+
+def _build_vocab() -> tuple[dict[str, int], dict[int, str]]:
+    tokens = []
+    idx = 0
+
+    # Pad token
+    PAD = "<PAD>"
+    tokens.append(PAD)
+
+    # Hex bytes: <00> through <FF>
+    for i in range(256):
+        tokens.append(f"<{i:02X}>")
+
+    # Registers: <V0>..<VF>
+    for i in range(16):
+        tokens.append(f"<V{i:X}>")
+
+    # Special registers
+    for reg in ["<PC>", "<I>", "<DT>", "<ST>", "<SP>"]:
+        tokens.append(reg)
+
+    # Trace labels
+    tokens.append("<PC:>")
+    tokens.append("<FETCH:>")
+    tokens.append("<OP:>")
+
+    # Write labels: W_V0..W_VF, W_I, W_PC, W_DT, W_ST, W_SP, W_MEM:, W_DISPLAY:
+    for i in range(16):
+        tokens.append(f"<W_V{i:X}>")
+    tokens.append("<W_I>")
+    tokens.append("<W_PC>")
+    tokens.append("<W_DT>")
+    tokens.append("<W_ST>")
+    tokens.append("<W_SP>")
+    tokens.append("<W_MEM:>")
+    tokens.append("<W_DISPLAY>")
+
+    # Opcode mnemonics
+    opcodes = [
+        "CLS", "RET", "JP_ADDR", "CALL_ADDR", "SE_VX_NN", "SNE_VX_NN",
+        "SE_VX_VY", "LD_VX_NN", "ADD_VX_NN", "LD_VX_VY", "OR_VX_VY",
+        "AND_VX_VY", "XOR_VX_VY", "ADD_VX_VY", "SUB_VX_VY", "SHR_VX_VY",
+        "SUBN_VX_VY", "SHL_VX_VY", "SNE_VX_VY", "LD_I_ADDR", "JP_V0_ADDR",
+        "RND_VX_NN", "DRW_VX_VY_N", "SKP_VX", "SKNP_VX", "LD_VX_DT",
+        "LD_VX_K", "LD_DT_VX", "LD_ST_VX", "ADD_I_VX", "LD_F_VX",
+        "LD_B_VX", "LD_I_VX", "LD_VX_I",
+    ]
+    for op in opcodes:
+        tokens.append(f"<{op}>")
+
+    # Control tokens
+    for ctrl in ["<MEM_START>", "<MEM_END>", "<REG_START>", "<REG_END>",
+                 "<TRACE_START>", "<SEP>", "<ADDR:>", "<VAL:>"]:
+        tokens.append(ctrl)
+
+    # Keypad tokens
+    for i in range(16):
+        tokens.append(f"<KEY_{i:X}>")
+    tokens.append("<KEY_UP>")
+    tokens.append("<KEY_DOWN>")
+    tokens.append("<KEY_LEFT>")
+    tokens.append("<KEY_RIGHT>")
+    tokens.append("<NO_KEY>")
+
+    # Brackets for trace parsing
+    tokens.append("[")
+    tokens.append("]")
+
+    # Colon
+    tokens.append(":")
+
+    # Build mappings
+    token_to_id = {t: i for i, t in enumerate(tokens)}
+    id_to_token = {i: t for i, t in enumerate(tokens)}
+
+    return token_to_id, id_to_token, tokens
+
+
+class Tokenizer:
+    """Custom CHIP-8 tokenizer."""
+
+    def __init__(self):
+        self.token_to_id, self.id_to_token, self.vocab = _build_vocab()
+        self.vocab_size = len(self.vocab)
+        self.pad_id = self.token_to_id["<PAD>"]
+
+    def encode_line(self, line: str) -> list[int]:
+        """Encode a single trace line or snapshot line into token IDs.
+
+        We parse the structured format by splitting on spaces and colons,
+        then looking up each token.
+        """
+        ids = []
+        # Split on spaces first
+        parts = line.split()
+        for part in parts:
+            # Handle bracketed tokens like [PC:0200]
+            if part.startswith("[") and part.endswith("]"):
+                inner = part[1:-1]
+                ids.append(self.token_to_id["["])
+                self._encode_inner(inner, ids)
+                ids.append(self.token_to_id["]"])
+            # Handle angle-bracket tokens like <MEM_START>, <0200:60>, <V0:00>
+            elif part.startswith("<") and part.endswith(">"):
+                inner = part[1:-1]
+                # Check if it's a simple control token
+                if inner in self.token_to_id:
+                    ids.append(self.token_to_id[part])
+                else:
+                    # It's a value token like <0200:60> or <V0:00>
+                    self._encode_value_token(inner, ids)
+            else:
+                # Fallback: try direct lookup
+                if part in self.token_to_id:
+                    ids.append(self.token_to_id[part])
+        return ids
+
+    def _encode_inner(self, inner: str, ids: list[int]):
+        """Encode the inside of a bracketed token like 'PC:0200' or 'OP:LD_VX_NN'."""
+        if ":" in inner:
+            label, value = inner.split(":", 1)
+            label_token = f"<{label}:>"
+            if label_token in self.token_to_id:
+                ids.append(self.token_to_id[label_token])
+            elif f"<{label}>" in self.token_to_id:
+                ids.append(self.token_to_id[f"<{label}>"])
+
+            # Encode value: either hex bytes or opcode name
+            if label == "OP":
+                op_token = f"<{value}>"
+                if op_token in self.token_to_id:
+                    ids.append(self.token_to_id[op_token])
+            elif label in ("W_MEM",):
+                # W_MEM format: "00:01:02:03:04" — address:byte pairs
+                ids.append(self.token_to_id["<W_MEM:>"])
+                for byte_str in value.split(":"):
+                    tok = f"<{byte_str}>"
+                    if tok in self.token_to_id:
+                        ids.append(self.token_to_id[tok])
+            else:
+                # Hex value like "0200" or "05"
+                self._encode_hex(value, ids)
+
+    def _encode_hex(self, hex_str: str, ids: list[int]):
+        """Encode a hex string byte by byte (2 chars at a time)."""
+        hex_str = hex_str.upper()
+        # Pad to even length
+        if len(hex_str) % 2 != 0:
+            hex_str = "0" + hex_str
+        for i in range(0, len(hex_str), 2):
+            byte = hex_str[i:i+2]
+            tok = f"<{byte}>"
+            if tok in self.token_to_id:
+                ids.append(self.token_to_id[tok])
+
+    def _encode_value_token(self, inner: str, ids: list[int]):
+        """Encode tokens like '0200:60' or 'V0:00'."""
+        if ":" in inner:
+            label, value = inner.split(":", 1)
+            # Register value: <V0:00>
+            reg_token = f"<{label}>"
+            if reg_token in self.token_to_id:
+                ids.append(self.token_to_id[reg_token])
+                self._encode_hex(value, ids)
+            else:
+                # Memory value: <0200:60>
+                self._encode_hex(label, ids)
+                self._encode_hex(value, ids)
+
+    def decode(self, ids: list[int]) -> str:
+        """Decode token IDs back to string."""
+        return " ".join(self.id_to_token.get(i, "<UNK>") for i in ids)
+
+    def decode_line(self, ids: list[int]) -> str:
+        """Decode with reconstruction of bracket notation."""
+        result = []
+        i = 0
+        while i < len(ids):
+            tok = self.id_to_token.get(ids[i], "<UNK>")
+            if tok == "[":
+                # Collect until "]"
+                inner_parts = []
+                i += 1
+                while i < len(ids) and self.id_to_token.get(ids[i]) != "]":
+                    inner_parts.append(self.id_to_token.get(ids[i], "<UNK>"))
+                    i += 1
+                result.append("[" + "".join(inner_parts).replace("<", "").replace(">", "").replace(":", ":", 1) + "]")
+                if i < len(ids):
+                    i += 1  # skip "]"
+            else:
+                result.append(tok)
+                i += 1
+        return " ".join(result)
+
+    def encode_trace(self, trace_lines: list[str]) -> list[int]:
+        """Encode a full list of trace lines into one flat token ID list."""
+        all_ids = []
+        for line in trace_lines:
+            ids = self.encode_line(line)
+            all_ids.extend(ids)
+        return all_ids
+</file>
+
+<file path="emulator/cpu.py">
+"""CHIP-8 CPU: fetch-decode-execute with all 35 opcodes (COSMAC VIP quirks)."""
+
+from __future__ import annotations
+
+import random
+from dataclasses import dataclass, field
+
+from .memory import Memory
+from .display import Display
+from .keypad import Keypad
+
+# Opcode mnemonics
+OPCODE_NAMES = {
+    0x00E0: "CLS",
+    0x00EE: "RET",
+    0x1: "JP_ADDR",
+    0x2: "CALL_ADDR",
+    0x3: "SE_VX_NN",
+    0x4: "SNE_VX_NN",
+    0x5: "SE_VX_VY",
+    0x6: "LD_VX_NN",
+    0x7: "ADD_VX_NN",
+    0x80: "LD_VX_VY",
+    0x81: "OR_VX_VY",
+    0x82: "AND_VX_VY",
+    0x83: "XOR_VX_VY",
+    0x84: "ADD_VX_VY",
+    0x85: "SUB_VX_VY",
+    0x86: "SHR_VX_VY",
+    0x87: "SUBN_VX_VY",
+    0x8E: "SHL_VX_VY",
+    0x9: "SNE_VX_VY",
+    0xA: "LD_I_ADDR",
+    0xB: "JP_V0_ADDR",
+    0xC: "RND_VX_NN",
+    0xD: "DRW_VX_VY_N",
+    0xE9E: "SKP_VX",
+    0xEA1: "SKNP_VX",
+    0xF07: "LD_VX_DT",
+    0xF0A: "LD_VX_K",
+    0xF15: "LD_DT_VX",
+    0xF18: "LD_ST_VX",
+    0xF1E: "ADD_I_VX",
+    0xF29: "LD_F_VX",
+    0xF33: "LD_B_VX",
+    0xF55: "LD_I_VX",
+    0xF65: "LD_VX_I",
+}
+
+
+def decode_opcode(opcode: int) -> str:
+    """Return mnemonic for an opcode."""
+    if opcode == 0x00E0:
+        return "CLS"
+    if opcode == 0x00EE:
+        return "RET"
+    hi = opcode >> 8
+    lo = opcode & 0xFF
+    nnn = opcode & 0x0FFF
+    x = (opcode >> 8) & 0x0F
+    y = (opcode >> 4) & 0x0F
+    n = opcode & 0x0F
+    nn = opcode & 0xFF
+
+    family = hi >> 4
+    sub = hi & 0x0F
+
+    if family == 0x1:
+        return "JP_ADDR"
+    if family == 0x2:
+        return "CALL_ADDR"
+    if family == 0x3:
+        return "SE_VX_NN"
+    if family == 0x4:
+        return "SNE_VX_NN"
+    if family == 0x5:
+        return "SE_VX_VY"
+    if family == 0x6:
+        return "LD_VX_NN"
+    if family == 0x7:
+        return "ADD_VX_NN"
+    if family == 0x8:
+        return OPCODE_NAMES.get(0x80 | n, f"UNKNOWN_{opcode:04X}")
+    if family == 0x9:
+        return "SNE_VX_VY"
+    if family == 0xA:
+        return "LD_I_ADDR"
+    if family == 0xB:
+        return "JP_V0_ADDR"
+    if family == 0xC:
+        return "RND_VX_NN"
+    if family == 0xD:
+        return "DRW_VX_VY_N"
+    if family == 0xE:
+        if lo == 0x9E:
+            return "SKP_VX"
+        if lo == 0xA1:
+            return "SKNP_VX"
+    if family == 0xF:
+        return OPCODE_NAMES.get(0xF00 | lo, f"UNKNOWN_{opcode:04X}")
+
+    return f"UNKNOWN_{opcode:04X}"
+
+
+@dataclass
+class CPUState:
+    V: list[int] = field(default_factory=lambda: [0] * 16)
+    I: int = 0
+    PC: int = 0x200
+    SP: int = 0
+    stack: list[int] = field(default_factory=lambda: [0] * 16)
+    DT: int = 0
+    ST: int = 0
+
+
+class CPU:
+    def __init__(self, seed: int | None = None):
+        self.state = CPUState()
+        self.memory = Memory()
+        self.display = Display()
+        self.keypad = Keypad()
+        self.rng = random.Random(seed)
+        self.halted = False
+        self.waiting_for_key = False
+        self.wait_key_reg = 0
+
+    def reset(self):
+        self.state = CPUState()
+        self.display.clear()
+        self.keypad.reset()
+        self.halted = False
+        self.waiting_for_key = False
+
+    def load_rom(self, rom: bytes):
+        self.memory.reset()
+        self.memory.load_rom(rom)
+
+    def tick_timers(self):
+        if self.state.DT > 0:
+            self.state.DT -= 1
+        if self.state.ST > 0:
+            self.state.ST -= 1
+
+    def step(self) -> dict:
+        """Execute one cycle. Returns trace dict of what happened."""
+        if self.halted:
+            return {"halted": True}
+
+        if self.waiting_for_key:
+            key = self.keypad.any_pressed()
+            if key is not None:
+                self.state.V[self.wait_key_reg] = key
+                self.waiting_for_key = False
+                self.state.PC += 2
+            return {"waiting_for_key": True}
+
+        s = self.state
+        pc = s.PC
+        opcode = self.memory.read_word(pc)
+        mnemonic = decode_opcode(opcode)
+
+        trace = {
+            "pc": pc,
+            "opcode": opcode,
+            "mnemonic": mnemonic,
+            "writes": [],
+        }
+
+        family = (opcode >> 12) & 0x0F
+        x = (opcode >> 8) & 0x0F
+        y = (opcode >> 4) & 0x0F
+        n = opcode & 0x0F
+        nn = opcode & 0xFF
+        nnn = opcode & 0x0FFF
+
+        if opcode == 0x00E0:
+            # CLS
+            self.display.clear()
+            s.PC += 2
+
+        elif opcode == 0x00EE:
+            # RET
+            s.SP = (s.SP - 1) & 0xF
+            s.PC = s.stack[s.SP]
+            trace["writes"].append(("W_PC", s.PC))
+
+        elif family == 0x1:
+            # JP addr
+            s.PC = nnn
+            trace["writes"].append(("W_PC", s.PC))
+
+        elif family == 0x2:
+            # CALL addr
+            s.stack[s.SP] = s.PC + 2
+            s.SP = (s.SP + 1) & 0xF
+            s.PC = nnn
+            trace["writes"].append(("W_PC", s.PC))
+
+        elif family == 0x3:
+            # SE Vx, nn
+            if s.V[x] == nn:
+                s.PC += 4
+            else:
+                s.PC += 2
+            trace["writes"].append(("W_PC", s.PC))
+
+        elif family == 0x4:
+            # SNE Vx, nn
+            if s.V[x] != nn:
+                s.PC += 4
+            else:
+                s.PC += 2
+            trace["writes"].append(("W_PC", s.PC))
+
+        elif family == 0x5:
+            # SE Vx, Vy
+            if s.V[x] == s.V[y]:
+                s.PC += 4
+            else:
+                s.PC += 2
+            trace["writes"].append(("W_PC", s.PC))
+
+        elif family == 0x6:
+            # LD Vx, nn
+            s.V[x] = nn
+            s.PC += 2
+            trace["writes"].append((f"W_V{x:X}", nn))
+            trace["writes"].append(("W_PC", s.PC))
+
+        elif family == 0x7:
+            # ADD Vx, nn (no carry)
+            s.V[x] = (s.V[x] + nn) & 0xFF
+            s.PC += 2
+            trace["writes"].append((f"W_V{x:X}", s.V[x]))
+            trace["writes"].append(("W_PC", s.PC))
+
+        elif family == 0x8:
+            self._exec_arithmetic(opcode, x, y, n, trace)
+            s.PC += 2
+            trace["writes"].append(("W_PC", s.PC))
+
+        elif family == 0x9:
+            # SNE Vx, Vy
+            if s.V[x] != s.V[y]:
+                s.PC += 4
+            else:
+                s.PC += 2
+            trace["writes"].append(("W_PC", s.PC))
+
+        elif family == 0xA:
+            # LD I, addr
+            s.I = nnn
+            s.PC += 2
+            trace["writes"].append(("W_I", nnn))
+            trace["writes"].append(("W_PC", s.PC))
+
+        elif family == 0xB:
+            # JP V0, addr
+            s.PC = nnn + s.V[0]
+            trace["writes"].append(("W_PC", s.PC))
+
+        elif family == 0xC:
+            # RND Vx, nn
+            r = self.rng.randint(0, 255)
+            s.V[x] = r & nn
+            s.PC += 2
+            trace["writes"].append((f"W_V{x:X}", s.V[x]))
+            trace["writes"].append(("W_PC", s.PC))
+
+        elif family == 0xD:
+            # DRW Vx, Vy, n
+            sprite = self.memory.read_range(s.I, n)
+            collision = self.display.draw_sprite(s.V[x], s.V[y], sprite)
+            s.V[0xF] = 1 if collision else 0
+            s.PC += 2
+            trace["writes"].append(("W_VF", s.V[0xF]))
+            trace["writes"].append(("W_DISPLAY", 1))
+            trace["writes"].append(("W_PC", s.PC))
+
+        elif family == 0xE:
+            if nn == 0x9E:
+                # SKP Vx
+                if self.keypad.is_pressed(s.V[x] & 0xF):
+                    s.PC += 4
+                else:
+                    s.PC += 2
+            elif nn == 0xA1:
+                # SKNP Vx
+                if not self.keypad.is_pressed(s.V[x] & 0xF):
+                    s.PC += 4
+                else:
+                    s.PC += 2
+            trace["writes"].append(("W_PC", s.PC))
+
+        elif family == 0xF:
+            self._exec_misc(opcode, x, nn, trace)
+            s.PC += 2
+            trace["writes"].append(("W_PC", s.PC))
+
+        return trace
+
+    def _exec_arithmetic(self, opcode: int, x: int, y: int, n: int, trace: dict):
+        s = self.state
+        if n == 0x0:
+            # LD Vx, Vy
+            s.V[x] = s.V[y]
+            trace["writes"].append((f"W_V{x:X}", s.V[x]))
+        elif n == 0x1:
+            # OR Vx, Vy (COSMAC: VF reset)
+            s.V[x] = (s.V[x] | s.V[y]) & 0xFF
+            s.V[0xF] = 0
+            trace["writes"].append((f"W_V{x:X}", s.V[x]))
+            trace["writes"].append(("W_VF", 0))
+        elif n == 0x2:
+            # AND Vx, Vy (COSMAC: VF reset)
+            s.V[x] = (s.V[x] & s.V[y]) & 0xFF
+            s.V[0xF] = 0
+            trace["writes"].append((f"W_V{x:X}", s.V[x]))
+            trace["writes"].append(("W_VF", 0))
+        elif n == 0x3:
+            # XOR Vx, Vy (COSMAC: VF reset)
+            s.V[x] = (s.V[x] ^ s.V[y]) & 0xFF
+            s.V[0xF] = 0
+            trace["writes"].append((f"W_V{x:X}", s.V[x]))
+            trace["writes"].append(("W_VF", 0))
+        elif n == 0x4:
+            # ADD Vx, Vy
+            result = s.V[x] + s.V[y]
+            s.V[x] = result & 0xFF
+            s.V[0xF] = 1 if result > 0xFF else 0
+            trace["writes"].append((f"W_V{x:X}", s.V[x]))
+            trace["writes"].append(("W_VF", s.V[0xF]))
+        elif n == 0x5:
+            # SUB Vx, Vy
+            s.V[0xF] = 1 if s.V[x] >= s.V[y] else 0
+            s.V[x] = (s.V[x] - s.V[y]) & 0xFF
+            trace["writes"].append((f"W_V{x:X}", s.V[x]))
+            trace["writes"].append(("W_VF", s.V[0xF]))
+        elif n == 0x6:
+            # SHR Vx, {Vy} — COSMAC: shift VY
+            s.V[0xF] = s.V[y] & 1
+            s.V[x] = s.V[y] >> 1
+            trace["writes"].append((f"W_V{x:X}", s.V[x]))
+            trace["writes"].append(("W_VF", s.V[0xF]))
+        elif n == 0x7:
+            # SUBN Vx, Vy
+            s.V[0xF] = 1 if s.V[y] >= s.V[x] else 0
+            s.V[x] = (s.V[y] - s.V[x]) & 0xFF
+            trace["writes"].append((f"W_V{x:X}", s.V[x]))
+            trace["writes"].append(("W_VF", s.V[0xF]))
+        elif n == 0xE:
+            # SHL Vx, {Vy} — COSMAC: shift VY
+            s.V[0xF] = (s.V[y] >> 7) & 1
+            s.V[x] = (s.V[y] << 1) & 0xFF
+            trace["writes"].append((f"W_V{x:X}", s.V[x]))
+            trace["writes"].append(("W_VF", s.V[0xF]))
+
+    def _exec_misc(self, opcode: int, x: int, nn: int, trace: dict):
+        s = self.state
+        if nn == 0x07:
+            # LD Vx, DT
+            s.V[x] = s.DT
+            trace["writes"].append((f"W_V{x:X}", s.V[x]))
+        elif nn == 0x0A:
+            # LD Vx, K — wait for key
+            self.waiting_for_key = True
+            self.wait_key_reg = x
+        elif nn == 0x15:
+            # LD DT, Vx
+            s.DT = s.V[x]
+            trace["writes"].append(("W_DT", s.DT))
+        elif nn == 0x18:
+            # LD ST, Vx
+            s.ST = s.V[x]
+            trace["writes"].append(("W_ST", s.ST))
+        elif nn == 0x1E:
+            # ADD I, Vx
+            s.I = (s.I + s.V[x]) & 0xFFF
+            trace["writes"].append(("W_I", s.I))
+        elif nn == 0x29:
+            # LD F, Vx — font sprite location
+            s.I = (s.V[x] & 0x0F) * 5
+            trace["writes"].append(("W_I", s.I))
+        elif nn == 0x33:
+            # LD B, Vx — BCD
+            val = s.V[x]
+            self.memory.write_byte(s.I, val // 100)
+            self.memory.write_byte(s.I + 1, (val // 10) % 10)
+            self.memory.write_byte(s.I + 2, val % 10)
+            trace["writes"].append(("W_MEM", f"{s.I:03X}:{val // 100:02X}"))
+            trace["writes"].append(("W_MEM", f"{s.I + 1:03X}:{(val // 10) % 10:02X}"))
+            trace["writes"].append(("W_MEM", f"{s.I + 2:03X}:{val % 10:02X}"))
+        elif nn == 0x55:
+            # LD [I], V0..Vx — COSMAC: I increments
+            for i in range(x + 1):
+                self.memory.write_byte(s.I + i, s.V[i])
+                trace["writes"].append(("W_MEM", f"{s.I + i:03X}:{s.V[i]:02X}"))
+            s.I = (s.I + x + 1) & 0xFFF
+            trace["writes"].append(("W_I", s.I))
+        elif nn == 0x65:
+            # LD V0..Vx, [I] — COSMAC: I increments
+            for i in range(x + 1):
+                s.V[i] = self.memory.read_byte(s.I + i)
+                trace["writes"].append((f"W_V{i:X}", s.V[i]))
+            s.I = (s.I + x + 1) & 0xFFF
+            trace["writes"].append(("W_I", s.I))
+</file>
+
+<file path="emulator/display.py">
+"""CHIP-8 display: 64x32 monochrome framebuffer."""
+
+
+class Display:
+    WIDTH = 64
+    HEIGHT = 32
+
+    def __init__(self):
+        self.pixels = [[0] * self.WIDTH for _ in range(self.HEIGHT)]
+
+    def clear(self):
+        for y in range(self.HEIGHT):
+            for x in range(self.WIDTH):
+                self.pixels[y][x] = 0
+
+    def get_pixel(self, x: int, y: int) -> int:
+        return self.pixels[y % self.HEIGHT][x % self.WIDTH]
+
+    def xor_pixel(self, x: int, y: int) -> bool:
+        """XOR a pixel. Returns True if collision (pixel was on, now off)."""
+        x %= self.WIDTH
+        y %= self.HEIGHT
+        old = self.pixels[y][x]
+        self.pixels[y][x] ^= 1
+        return old == 1 and self.pixels[y][x] == 0
+
+    def draw_sprite(self, x: int, y: int, sprite: list[int]) -> bool:
+        """Draw sprite at (x, y). Returns True if any collision occurred."""
+        collision = False
+        for row, byte in enumerate(sprite):
+            for bit in range(8):
+                if byte & (0x80 >> bit):
+                    if self.xor_pixel(x + bit, y + row):
+                        collision = True
+        return collision
+
+    def buffer(self) -> list[list[int]]:
+        return [row[:] for row in self.pixels]
+</file>
+
+<file path="emulator/keypad.py">
+"""CHIP-8 keypad: 16 keys (0x0 - 0xF)."""
+
+
+class Keypad:
+    def __init__(self):
+        self.keys = [False] * 16
+
+    def press(self, key: int):
+        self.keys[key & 0xF] = True
+
+    def release(self, key: int):
+        self.keys[key & 0xF] = False
+
+    def is_pressed(self, key: int) -> bool:
+        return self.keys[key & 0xF]
+
+    def any_pressed(self) -> int | None:
+        """Return first pressed key value, or None."""
+        for i, pressed in enumerate(self.keys):
+            if pressed:
+                return i
+        return None
+
+    def reset(self):
+        self.keys = [False] * 16
+</file>
+
+<file path="emulator/tracer.py">
+"""Tracer: converts CPU execution into structured token traces."""
+
+from __future__ import annotations
+
+from .cpu import CPU
+
+
+def format_trace_line(trace: dict) -> str:
+    """Convert a single cycle trace dict into token string.
+
+    Format: [PC:XXXX] [FETCH:XXXX] [OP:MNEMONIC] [W_REG:VAL] ...
+    """
+    if trace.get("halted") or trace.get("waiting_for_key"):
+        return ""
+
+    pc = trace["pc"]
+    opcode = trace["opcode"]
+    mnemonic = trace["mnemonic"]
+
+    parts = [
+        f"[PC:{pc:04X}]",
+        f"[FETCH:{opcode:04X}]",
+        f"[OP:{mnemonic}]",
+    ]
+
+    for write_type, write_val in trace["writes"]:
+        if write_type.startswith("W_V"):
+            parts.append(f"[{write_type}:{write_val:02X}]")
+        elif write_type == "W_I":
+            parts.append(f"[W_I:{write_val:03X}]")
+        elif write_type == "W_PC":
+            parts.append(f"[W_PC:{write_val:04X}]")
+        elif write_type == "W_DT":
+            parts.append(f"[W_DT:{write_val:02X}]")
+        elif write_type == "W_ST":
+            parts.append(f"[W_ST:{write_val:02X}]")
+        elif write_type == "W_MEM":
+            parts.append(f"[W_MEM:{write_val}]")
+        elif write_type == "W_DISPLAY":
+            parts.append("[W_DISPLAY:1]")
+
+    return " ".join(parts)
+
+
+def format_mem_snapshot(memory) -> str:
+    """Format memory non-zero bytes as token string."""
+    snapshot = memory.snapshot()
+    entries = " ".join(f"<{addr:04X}:{val:02X}>" for addr, val in snapshot)
+    return f"<MEM_START> {entries} <MEM_END>"
+
+
+def format_reg_snapshot(state) -> str:
+    """Format register state as token string."""
+    parts = []
+    for i in range(16):
+        parts.append(f"<V{i:X}:{state.V[i]:02X}>")
+    parts.append(f"<I:{state.I:03X}>")
+    parts.append(f"<PC:{state.PC:04X}>")
+    parts.append(f"<DT:{state.DT:02X}>")
+    parts.append(f"<ST:{state.ST:02X}>")
+    parts.append(f"<SP:{state.SP:02X}>")
+    return f"<REG_START> {' '.join(parts)} <REG_END>"
+
+
+def generate_trace(cpu: CPU, max_cycles: int = 10000,
+                   snapshot_interval: int = 0) -> list[str]:
+    """Run CPU and produce list of trace lines.
+
+    Args:
+        cpu: Running CPU instance
+        max_cycles: Maximum cycles to execute
+        snapshot_interval: If > 0, re-inject state snapshot every N cycles
+
+    Returns:
+        List of token strings (trace lines and optional snapshots)
+    """
+    lines = []
+    lines.append(format_mem_snapshot(cpu.memory))
+    lines.append(format_reg_snapshot(cpu.state))
+    lines.append("<TRACE_START>")
+
+    for cycle in range(max_cycles):
+        trace = cpu.step()
+
+        if trace.get("halted"):
+            break
+
+        if trace.get("waiting_for_key"):
+            continue
+
+        line = format_trace_line(trace)
+        if line:
+            lines.append(line)
+
+        if snapshot_interval > 0 and (cycle + 1) % snapshot_interval == 0:
+            lines.append(format_reg_snapshot(cpu.state))
+
+    return lines
+</file>
+
+<file path="hull/kv_cache.py">
+"""Convex hull KV-cache for O(log N) attention inference.
+
+For 2D attention heads (d_head=2), the maximum dot product Q·K occurs
+at a vertex of the convex hull of the key points. By maintaining a
+convex hull per head, we can find the best key in O(log V) where V
+is the number of hull vertices (V << N in practice).
+
+Uses scipy.spatial.ConvexHull for hull computation.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import torch
+
+try:
+    from scipy.spatial import ConvexHull, QhullError
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
+
+
+class ConvexHullKVCache:
+    """Per-head convex hull cache for 2D key vectors.
+
+    Stores raw K, V tensors and maintains a convex hull index
+    for fast nearest-key lookup per head.
+    """
+
+    def __init__(self, n_heads: int, d_head: int = 2):
+        assert d_head == 2, "Convex hull cache requires d_head=2"
+        self.n_heads = n_heads
+        self.d_head = d_head
+
+        # Raw KV storage (grown dynamically)
+        self.K_cache: list[torch.Tensor] = []  # list of (B, n_heads, 1, 2)
+        self.V_cache: list[torch.Tensor] = []
+
+        # Per-head convex hull vertices (indices into K_cache)
+        # hull_vertices[h] = sorted list of indices on the hull for head h
+        self.hull_vertices: list[list[int]] = [[] for _ in range(n_heads)]
+
+        # Full 2D points per head (for hull computation)
+        self.points_per_head: list[list[np.ndarray]] = [[] for _ in range(n_heads)]
+
+    def append(self, K_new: torch.Tensor, V_new: torch.Tensor):
+        """Add new key-value pairs.
+
+        Args:
+            K_new: (B, n_heads, 1, d_head)
+            V_new: (B, n_heads, 1, d_head)
+        """
+        self.K_cache.append(K_new.detach().cpu())
+        self.V_cache.append(V_new.detach().cpu())
+
+        # Update hull for each head
+        step_idx = len(self.K_cache) - 1
+        for h in range(self.n_heads):
+            point = K_new[0, h, 0, :].numpy()  # (2,)
+            self.points_per_head[h].append(point)
+
+            # Rebuild hull for this head
+            self._rebuild_hull(h)
+
+    def _rebuild_hull(self, head_idx: int):
+        """Rebuild the convex hull for a specific head."""
+        points = self.points_per_head[head_idx]
+        if len(points) < 3:
+            # Hull needs at least 3 points
+            self.hull_vertices[head_idx] = list(range(len(points)))
+            return
+
+        if not HAS_SCIPY:
+            # Fallback: use all points as "hull"
+            self.hull_vertices[head_idx] = list(range(len(points)))
+            return
+
+        pts_array = np.array(points)
+        try:
+            hull = ConvexHull(pts_array)
+            self.hull_vertices[head_idx] = sorted(hull.vertices.tolist())
+        except QhullError:
+            # Degenerate case (collinear points)
+            self.hull_vertices[head_idx] = list(range(len(points)))
+
+    def query_hardmax(self, Q: torch.Tensor) -> torch.Tensor:
+        """Query the hull to find the nearest key for each head.
+
+        Args:
+            Q: (B, n_heads, 1, d_head)
+
+        Returns:
+            output: (B, n_heads, 1, d_head) — values of nearest hull keys
+        """
+        B = Q.shape[0]
+        outputs = torch.zeros_like(Q)
+
+        if not self.K_cache:
+            return outputs
+
+        # Stack all K and V
+        K_all = torch.cat(self.K_cache, dim=2)  # (B, n_heads, T, 2)
+        V_all = torch.cat(self.V_cache, dim=2)  # (B, n_heads, T, 2)
+
+        for h in range(self.n_heads):
+            hull_idx = self.hull_vertices[h]
+            if not hull_idx:
+                continue
+
+            # Get hull key points
+            hull_K = K_all[0, h, hull_idx, :]  # (V, 2)
+            q = Q[0, h, 0, :]  # (2,)
+
+            # Dot product with hull vertices
+            dots = torch.mv(hull_K, q)  # (V,)
+            best_local = dots.argmax().item()
+            best_global = hull_idx[best_local]
+
+            outputs[0, h, 0, :] = V_all[0, h, best_global, :]
+
+        return outputs
+
+    def __len__(self):
+        return len(self.K_cache)
+
+
+class StandardKVCache:
+    """Simple KV-cache without hull optimization (baseline)."""
+
+    def __init__(self):
+        self.K: torch.Tensor | None = None
+        self.V: torch.Tensor | None = None
+
+    def append(self, K_new: torch.Tensor, V_new: torch.Tensor):
+        if self.K is None:
+            self.K = K_new
+            self.V = V_new
+        else:
+            self.K = torch.cat([self.K, K_new], dim=2)
+            self.V = torch.cat([self.V, V_new], dim=2)
+
+    def query_hardmax(self, Q: torch.Tensor) -> torch.Tensor:
+        """Standard hardmax: dot product against ALL keys."""
+        scores = torch.matmul(Q, self.K.transpose(-2, -1))
+        idx = scores.argmax(dim=-1)
+        idx_expanded = idx.unsqueeze(-1).expand(-1, -1, -1, Q.shape[-1])
+        return torch.gather(self.V, dim=2, index=idx_expanded)
+
+    def __len__(self):
+        return 0 if self.K is None else self.K.shape[2]
+</file>
+
+<file path="model/hardmax.py">
+"""Hardmax attention for inference-time O(log N) lookups.
+
+Instead of softmax, we find the single key with maximum dot product
+for each query, then take that key's value directly.
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+
+def hardmax_attention_step(Q: torch.Tensor, K: torch.Tensor,
+                           V: torch.Tensor) -> torch.Tensor:
+    """Compute hardmax attention for a single query position.
+
+    Args:
+        Q: (B, n_heads, 1, d_head) — query for current position
+        K: (B, n_heads, T, d_head) — all cached keys
+        V: (B, n_heads, T, d_head) — all cached values
+
+    Returns:
+        output: (B, n_heads, 1, d_head) — the value of the nearest key
+        indices: (B, n_heads, 1) — which key was selected
+    """
+    # Dot product: (B, n_heads, 1, T)
+    scores = torch.matmul(Q, K.transpose(-2, -1))
+
+    # Argmax: which key has highest dot product
+    idx = scores.argmax(dim=-1)  # (B, n_heads, 1)
+
+    # Gather the corresponding value
+    idx_expanded = idx.unsqueeze(-1).expand(-1, -1, -1, Q.shape[-1])
+    out = torch.gather(V, dim=2, index=idx_expanded)
+
+    return out, idx
+
+
+def hardmax_attention_full(Q: torch.Tensor, K: torch.Tensor,
+                           V: torch.Tensor) -> torch.Tensor:
+    """Compute hardmax attention for full sequence.
+
+    Args:
+        Q: (B, n_heads, T, d_head)
+        K: (B, n_heads, T, d_head)
+        V: (B, n_heads, T, d_head)
+
+    Returns:
+        output: (B, n_heads, T, d_head)
+    """
+    scores = torch.matmul(Q, K.transpose(-2, -1))  # (B, n_heads, T, T)
+
+    # Apply causal mask (lower triangular = allowed)
+    T = Q.shape[2]
+    mask = torch.triu(torch.ones(T, T, device=Q.device), diagonal=1).bool()
+    scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+    idx = scores.argmax(dim=-1)  # (B, n_heads, T)
+    idx_expanded = idx.unsqueeze(-1).expand(-1, -1, -1, Q.shape[-1])
+    out = torch.gather(V, dim=2, index=idx_expanded)
+    return out
+</file>
+
+<file path=".gitignore">
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Virtual environments
+.venv/
+
+# Training artifacts
+checkpoints/
+*.pt
+*.pth
+
+# ROM files (user-supplied)
+*.ch8
+*.rom
+
+# macOS
+.DS_Store
+</file>
+
+<file path="generate.py">
+"""Game runner: load a ROM, run it through the trained transformer, render with pygame."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+
+import torch
+
+from data.tokenizer import Tokenizer
+from data.generator import load_rom_file, generate_random_rom
+from emulator.tracer import format_mem_snapshot, format_reg_snapshot
+from model.config import ModelConfig
+from model.transformer import Chip8Transformer
+
+
+KEY_MAP = {
+    # pygame key -> CHIP-8 key
+    # Standard CHIP-8 keypad mapping:
+    # 1 2 3 4     -> 1 2 3 C
+    # Q W E R     -> 4 5 6 D
+    # A S D F     -> 7 8 9 E
+    # Z X C V     -> A 0 B F
+}
+
+
+def build_key_map():
+    """Build pygame key -> CHIP-8 mapping."""
+    try:
+        import pygame
+    except ImportError:
+        return {}
+
+    return {
+        pygame.K_1: 0x1, pygame.K_2: 0x2, pygame.K_3: 0x3, pygame.K_4: 0xC,
+        pygame.K_q: 0x4, pygame.K_w: 0x5, pygame.K_e: 0x6, pygame.K_r: 0xD,
+        pygame.K_a: 0x7, pygame.K_s: 0x8, pygame.K_d: 0x9, pygame.K_f: 0xE,
+        pygame.K_z: 0xA, pygame.K_x: 0x0, pygame.K_c: 0xB, pygame.K_v: 0xF,
+    }
+
+
+def load_model(checkpoint_path: str, device: torch.device) -> tuple[Chip8Transformer, ModelConfig]:
+    """Load trained model from checkpoint."""
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    config = ckpt["config"]
+    model = Chip8Transformer(config).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+    return model, config
+
+
+def run_headless(model: Chip8Transformer, tokenizer: Tokenizer,
+                 rom: bytes, max_cycles: int, device: torch.device):
+    """Run the transformer emulator without display (headless mode)."""
+    # Build initial prompt
+    from emulator.cpu import CPU
+    cpu = CPU(seed=0)
+    cpu.load_rom(rom)
+
+    prompt_lines = []
+    prompt_lines.append(format_mem_snapshot(cpu.memory))
+    prompt_lines.append(format_reg_snapshot(cpu.state))
+    prompt_lines.append("<TRACE_START>")
+
+    prompt_text = " ".join(prompt_lines)
+    input_ids = tokenizer.encode_line(prompt_text)
+    input_tensor = torch.tensor([input_ids], dtype=torch.long, device=device)
+
+    print("Prompt tokens:", len(input_ids))
+    print("Generating trace...")
+
+    with torch.no_grad():
+        output = model.generate(input_tensor, max_new_tokens=max_cycles,
+                                temperature=0.01, use_hardmax=True)
+
+    generated = output[0, len(input_ids):].tolist()
+    decoded = tokenizer.decode(generated)
+    print(decoded[:5000])
+    print(f"\n... ({len(generated)} tokens generated)")
+
+
+def run_with_display(model: Chip8Transformer, tokenizer: Tokenizer,
+                     rom: bytes, max_cycles: int, device: torch.device):
+    """Run the transformer emulator with pygame display."""
+    try:
+        import pygame
+    except ImportError:
+        print("pygame not installed. Run: pip install pygame")
+        print("Falling back to headless mode.")
+        run_headless(model, tokenizer, rom, max_cycles, device)
+        return
+
+    SCALE = 10
+    WIDTH, HEIGHT = 64 * SCALE, 32 * SCALE
+    FPS = 60
+    CYCLES_PER_FRAME = 10  # ~600 Hz
+
+    pygame.init()
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    pygame.display.set_caption("CHIP-8 Transformer Emulator")
+    clock = pygame.time.Clock()
+
+    key_map = build_key_map()
+
+    # Build initial prompt from emulator state
+    from emulator.cpu import CPU
+    cpu = CPU(seed=0)
+    cpu.load_rom(rom)
+
+    prompt_lines = []
+    prompt_lines.append(format_mem_snapshot(cpu.memory))
+    prompt_lines.append(format_reg_snapshot(cpu.state))
+    prompt_lines.append("<TRACE_START>")
+
+    prompt_text = " ".join(prompt_lines)
+    input_ids = tokenizer.encode_line(prompt_text)
+    token_buffer = list(input_ids)
+
+    # Display state (parsed from generated tokens)
+    display_pixels = [[0] * 64 for _ in range(32)]
+
+    running = True
+    frame_count = 0
+
+    print("Running CHIP-8 Transformer Emulator")
+    print("Controls: 1-4, Q-W-E-R, A-S-D-F, Z-X-C-V")
+    print("Press ESC to quit")
+
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                elif event.key in key_map:
+                    chip8_key = key_map[event.key]
+                    token = f"<KEY_{chip8_key:X}>"
+                    if token in tokenizer.token_to_id:
+                        token_buffer.append(tokenizer.token_to_id[token])
+            elif event.type == pygame.KEYUP:
+                if event.key in key_map:
+                    chip8_key = key_map[event.key]
+                    token = f"<NO_KEY>"
+                    if token in tokenizer.token_to_id:
+                        token_buffer.append(tokenizer.token_to_id[token])
+
+        # Generate N cycles worth of tokens
+        input_tensor = torch.tensor([token_buffer], dtype=torch.long, device=device)
+        with torch.no_grad():
+            output = model.generate(
+                input_tensor,
+                max_new_tokens=CYCLES_PER_FRAME * 10,  # rough estimate
+                temperature=0.01,
+                use_hardmax=True,
+            )
+
+        new_tokens = output[0, len(token_buffer):].tolist()
+        token_buffer = output[0].tolist()
+
+        # Parse generated tokens for display updates
+        decoded = tokenizer.decode(new_tokens)
+        # Simple parsing: look for DRW instructions
+        # (Full implementation would maintain display state)
+
+        # Render
+        screen.fill((0, 0, 0))
+        for y in range(32):
+            for x in range(64):
+                if display_pixels[y][x]:
+                    pygame.draw.rect(screen, (255, 255, 255),
+                                     (x * SCALE, y * SCALE, SCALE, SCALE))
+
+        pygame.display.flip()
+        clock.tick(FPS)
+        frame_count += 1
+
+        # Trim buffer to prevent unbounded growth
+        if len(token_buffer) > 4096:
+            # Keep last 2048 tokens
+            token_buffer = token_buffer[-2048:]
+
+    pygame.quit()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run CHIP-8 Transformer Emulator")
+    parser.add_argument("checkpoint", help="Path to model checkpoint")
+    parser.add_argument("--rom", type=str, default=None,
+                        help="Path to .ch8 ROM file")
+    parser.add_argument("--random-rom", action="store_true",
+                        help="Generate a random ROM")
+    parser.add_argument("--cycles", type=int, default=2000,
+                        help="Max cycles to generate")
+    parser.add_argument("--headless", action="store_true",
+                        help="Run without display")
+    parser.add_argument("--cpu", action="store_true",
+                        help="Force CPU device")
+    args = parser.parse_args()
+
+    device = torch.device("cpu" if args.cpu else
+                          "mps" if torch.backends.mps.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    # Load model
+    print(f"Loading model from {args.checkpoint}...")
+    model, config = load_model(args.checkpoint, device)
+    print(f"Model loaded: {model.count_parameters():,} parameters")
+
+    tokenizer = Tokenizer()
+
+    # Load ROM
+    if args.rom:
+        rom = load_rom_file(args.rom)
+        print(f"Loaded ROM: {args.rom} ({len(rom)} bytes)")
+    elif args.random_rom:
+        import random
+        rom = generate_random_rom(random.Random(42), num_instructions=64)
+        print(f"Generated random ROM ({len(rom)} bytes)")
+    else:
+        print("No ROM specified. Use --rom or --random-rom")
+        sys.exit(1)
+
+    if args.headless:
+        run_headless(model, tokenizer, rom, args.cycles, device)
+    else:
+        run_with_display(model, tokenizer, rom, args.cycles, device)
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="pyproject.toml">
+[project]
+name = "chip8-transformer"
+version = "0.1.0"
+description = "CHIP-8 CPU emulator implemented as a transformer with 2D attention"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+    "scipy",
+    "pygame>=2.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+</file>
+
+<file path="emulator/memory.py">
+"""CHIP-8 memory: 4KB RAM with font data."""
+
+FONT_DATA = [
+    0xF0, 0x90, 0x90, 0x90, 0xF0,  # 0
+    0x20, 0x60, 0x20, 0x20, 0x70,  # 1
+    0xF0, 0x10, 0xF0, 0x80, 0xF0,  # 2
+    0xF0, 0x10, 0xF0, 0x10, 0xF0,  # 3
+    0x90, 0x90, 0xF0, 0x10, 0x10,  # 4
+    0xF0, 0x80, 0xF0, 0x10, 0xF0,  # 5
+    0xF0, 0x80, 0xF0, 0x90, 0xF0,  # 6
+    0xF0, 0x10, 0x20, 0x40, 0x40,  # 7
+    0xF0, 0x90, 0xF0, 0x90, 0xF0,  # 8
+    0xF0, 0x90, 0xF0, 0x10, 0xF0,  # 9
+    0xF0, 0x90, 0xF0, 0x90, 0x90,  # A
+    0xE0, 0x90, 0xE0, 0x90, 0xE0,  # B
+    0xF0, 0x80, 0x80, 0x80, 0xF0,  # C
+    0xE0, 0x90, 0x90, 0x90, 0xE0,  # D
+    0xF0, 0x80, 0xF0, 0x80, 0xF0,  # E
+    0xF0, 0x80, 0xF0, 0x80, 0x80,  # F
+]
+
+
+class Memory:
+    """4096-byte CHIP-8 RAM."""
+
+    def __init__(self):
+        self.ram = bytearray(4096)
+        self._load_font()
+
+    def _load_font(self):
+        for i, byte in enumerate(FONT_DATA):
+            self.ram[i] = byte
+
+    def reset(self):
+        self.ram = bytearray(4096)
+        self._load_font()
+
+    def load_rom(self, rom: bytes, addr: int = 0x200):
+        for i, byte in enumerate(rom):
+            self.ram[addr + i] = byte
+
+    def read_byte(self, addr: int) -> int:
+        return self.ram[addr & 0xFFF]
+
+    def write_byte(self, addr: int, value: int):
+        self.ram[addr & 0xFFF] = value & 0xFF
+
+    def read_word(self, addr: int) -> int:
+        """Read 16-bit big-endian word."""
+        return (self.ram[addr & 0xFFF] << 8) | self.ram[(addr + 1) & 0xFFF]
+
+    def read_range(self, start: int, length: int) -> list[int]:
+        return [self.ram[(start + i) & 0xFFF] for i in range(length)]
+
+    def snapshot(self, start_addr: int = 0x200) -> list[tuple[int, int]]:
+        """Return list of (addr, value) for non-zero bytes from start_addr onward."""
+        return [(addr, val) for addr, val in enumerate(self.ram) if val != 0 and addr >= start_addr]
+</file>
+
+<file path="model/config.py">
+"""Model configuration."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+
+
+@dataclass
+class ModelConfig:
+    vocab_size: int = 370
+    d_model: int = 256
+    n_heads: int = 128
+    d_head: int = 2         # 256 / 128 = 2D attention
+    n_layers: int = 6
+    d_ff: int = 1024        # 4 * d_model
+    max_seq_len: int = 512
+    dropout: float = 0.1
+    pad_token_id: int = 0
+    use_checkpoint: bool = True   # gradient checkpointing
+
+    # Temperature annealing
+    temp_start: float = 10.0
+    temp_end: float = 0.01
+
+    def __post_init__(self):
+        assert self.d_model == self.n_heads * self.d_head, \
+            f"d_model ({self.d_model}) must equal n_heads ({self.n_heads}) * d_head ({self.d_head})"
+
+    @staticmethod
+    def detect_device() -> torch.device:
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    @classmethod
+    def for_device(cls, device: torch.device, **kwargs) -> "ModelConfig":
+        """Create config with device-appropriate defaults.
+
+        CUDA (24GB+): seq_len=1024, checkpointing, full parallel attention
+        MPS (9GB):    seq_len=512,  checkpointing, chunked attention
+        CPU:          seq_len=256,  checkpointing, chunked attention
+        """
+        defaults = {}
+        if device.type == "cuda":
+            vram_gb = torch.cuda.get_device_properties(0).total_mem / 1e9
+            if vram_gb >= 40:
+                defaults = {"max_seq_len": 1024, "use_checkpoint": True}
+            elif vram_gb >= 20:
+                defaults = {"max_seq_len": 1024, "use_checkpoint": True}
+            else:
+                defaults = {"max_seq_len": 512, "use_checkpoint": True}
+        elif device.type == "mps":
+            defaults = {"max_seq_len": 512, "use_checkpoint": True}
+        else:
+            defaults = {"max_seq_len": 256, "use_checkpoint": True}
+
+        defaults.update(kwargs)
+        return cls(**defaults)
+</file>
+
+<file path="model/transformer.py">
+"""Causal transformer with 2D attention heads and RoPE."""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+from .config import ModelConfig
+from .attention import Attention2D
+
+try:
+    from torch.utils.checkpoint import checkpoint
+    HAS_CHECKPOINT = True
+except ImportError:
+    HAS_CHECKPOINT = False
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(config.d_model)
+        self.attn = Attention2D(
+            d_model=config.d_model,
+            n_heads=config.n_heads,
+            d_head=config.d_head,
+            max_seq_len=config.max_seq_len,
+            dropout=config.dropout,
+        )
+        self.ln2 = nn.LayerNorm(config.d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(config.d_model, config.d_ff),
+            nn.GELU(),
+            nn.Linear(config.d_ff, config.d_model),
+            nn.Dropout(config.dropout),
+        )
+
+    def forward(self, x: torch.Tensor, temperature: float = 1.0,
+                use_hardmax: bool = False, start_pos: int = 0) -> torch.Tensor:
+        x = x + self.attn(self.ln1(x), temperature=temperature,
+                          use_hardmax=use_hardmax, start_pos=start_pos)
+        x = x + self.ffn(self.ln2(x))
+        return x
+
+    def forward_step(self, x: torch.Tensor, kv_cache: tuple | None = None,
+                     temperature: float = 1.0,
+                     use_hardmax: bool = False, seq_pos: int = 0) -> tuple[torch.Tensor, tuple]:
+        normed = self.ln1(x)
+        attn_out, new_kv = self.attn.forward_step(
+            normed, kv_cache=kv_cache,
+            temperature=temperature, use_hardmax=use_hardmax, seq_pos=seq_pos
+        )
+        x = x + attn_out
+        x = x + self.ffn(self.ln2(x))
+        return x, new_kv
+
+
+class Chip8Transformer(nn.Module):
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        self.use_checkpoint = config.use_checkpoint
+
+        # Removed pos_emb to strictly enforce relative learning via RoPE
+        self.token_emb = nn.Embedding(config.vocab_size, config.d_model,
+                                       padding_idx=config.pad_token_id)
+        self.emb_dropout = nn.Dropout(config.dropout)
+
+        self.blocks = nn.ModuleList([
+            TransformerBlock(config) for _ in range(config.n_layers)
+        ])
+
+        self.ln_f = nn.LayerNorm(config.d_model)
+        self.head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+
+        self.head.weight = self.token_emb.weight
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.padding_idx is not None:
+                    module.weight.data[module.padding_idx].zero_()
+
+    def forward(self, input_ids: torch.Tensor,
+                temperature: float = 1.0,
+                use_hardmax: bool = False, start_pos: int = 0) -> torch.Tensor:
+        B, T = input_ids.shape
+        x = self.token_emb(input_ids)
+        x = self.emb_dropout(x)
+
+        for block in self.blocks:
+            if self.use_checkpoint and self.training and HAS_CHECKPOINT:
+                x = checkpoint(block, x, temperature, use_hardmax, start_pos,
+                               use_reentrant=False)
+            else:
+                x = block(x, temperature=temperature, use_hardmax=use_hardmax, start_pos=start_pos)
+
+        x = self.ln_f(x)
+        logits = self.head(x)
+        return logits
+
+    @torch.no_grad()
+    def generate(self, input_ids: torch.Tensor, max_new_tokens: int,
+                 temperature: float = 1.0,
+                 use_hardmax: bool = False) -> torch.Tensor:
+        self.eval()
+        cur = input_ids
+        B, T = cur.shape
+        
+        x = self.token_emb(cur)
+        x = self.emb_dropout(x)
+
+        kv_caches = []
+        for block in self.blocks:
+            normed = block.ln1(x)
+            K = block.attn.W_k(normed).view(B, T, block.attn.n_heads,
+                                              block.attn.d_head).transpose(1, 2)
+            V = block.attn.W_v(normed).view(B, T, block.attn.n_heads,
+                                              block.attn.d_head).transpose(1, 2)
+            
+            # Apply RoPE to prefill K cache
+            cos, sin = block.attn._get_cos_sin(0, T, x.device)
+            _, K = apply_rope(torch.zeros_like(K), K, cos, sin)
+            
+            kv_caches.append((K, V))
+            attn_out = block.attn(normed, temperature=temperature,
+                                  use_hardmax=use_hardmax, start_pos=0)
+            x = x + attn_out
+            x = x + block.ffn(block.ln2(x))
+
+        for step in range(max_new_tokens):
+            last_id = cur[:, -1:]
+            seq_pos = cur.shape[1] - 1  # Get exact position for RoPE
+            
+            x_step = self.token_emb(last_id)
+            new_kvs = []
+            
+            for i, block in enumerate(self.blocks):
+                normed = block.ln1(x_step)
+                attn_out, new_kv = block.attn.forward_step(
+                    normed, kv_cache=kv_caches[i],
+                    temperature=temperature, use_hardmax=use_hardmax,
+                    seq_pos=seq_pos
+                )
+                new_kvs.append(new_kv)
+                x_step = x_step + attn_out
+                x_step = x_step + block.ffn(block.ln2(x_step))
+
+            kv_caches = new_kvs
+            x_last = self.ln_f(x_step)
+            logits = self.head(x_last)
+            next_token = logits.argmax(dim=-1)
+            cur = torch.cat([cur, next_token], dim=1)
+
+        return cur
+
+    def count_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+</file>
+
+<file path="requirements.txt">
+torch>=2.0
+numpy
+scipy
+pygame>=2.5
+tqdm
+</file>
+
+<file path="SUMMARY.txt">
+CHIP-8 Transformer Emulator — Project Summary
+===============================================
+
+Overview
+--------
+A transformer that emulates a CHIP-8 CPU using 2D attention heads. Each of the
+128 attention heads operates on 2-dimensional key/query vectors, enabling
+O(log N) inference via convex hull lookup of the nearest key to each query.
+
+Project Structure
+-----------------
+chip8/
+├── emulator/           # CHIP-8 CPU implementation
+│   ├── cpu.py          # Fetch-decode-execute loop, all 35 opcodes
+│   ├── memory.py       # 4KB RAM with font data at 0x000
+│   ├── display.py      # 64×32 monochrome framebuffer, XOR sprite drawing
+│   ├── keypad.py       # 16-key hex keypad input
+│   └── tracer.py       # Converts execution to token trace strings
+├── data/               # Data pipeline
+│   ├── tokenizer.py    # Custom ~370-token vocabulary (no BPE)
+│   ├── generator.py    # Random ROM generation + fuzzing
+│   └── dataset.py      # PyTorch Dataset with sliding window
+├── model/              # Transformer architecture
+│   ├── config.py       # ModelConfig with device-aware defaults
+│   ├── attention.py    # 2D attention: CUDA fast path + MPS/CPU chunked path
+│   ├── transformer.py  # Full causal transformer with KV-cache generation
+│   └── hardmax.py      # Standalone hardmax attention functions
+├── hull/               # O(log N) inference optimization
+│   └── kv_cache.py     # Convex hull KV-cache using scipy.spatial.ConvexHull
+├── train.py            # Training loop with temperature annealing
+├── generate.py         # Game runner (headless or pygame)
+├── .gitignore
+├── pyproject.toml
+└── requirements.txt
+
+===============================================================================
+PHASE 1: CHIP-8 Emulator
+===============================================================================
+
+emulator/memory.py
+------------------
+- 4096-byte RAM (bytearray)
+- Font data loaded at 0x000: digits 0-F as 4×5 pixel sprites (80 bytes)
+- Methods: load_rom(), read_byte(), write_byte(), read_word(), read_range(),
+  snapshot(start_addr=0x200) (returns non-zero address/value pairs from
+  start_addr onward; skips font region to save tokens)
+
+emulator/display.py
+-------------------
+- 64×32 monochrome framebuffer (list of lists)
+- clear(), get_pixel(), xor_pixel(), draw_sprite()
+- Sprites are XOR'd onto display; collision detection returns True if any
+  pixel was turned off (used for VF flag in DRW instruction)
+- Sprite wrapping at screen edges (COSMAC VIP behavior)
+
+emulator/keypad.py
+------------------
+- 16-key state (0x0-0xF)
+- press(), release(), is_pressed(), any_pressed()
+
+emulator/cpu.py
+---------------
+- All 35 CHIP-8 opcodes implemented with COSMAC VIP quirks:
+  - 8XY1/8XY2/8XY3: VF reset to 0 after OR/AND/XOR
+  - 8XY6/8XYE: Shift VY, not VX (original COSMAC behavior)
+  - FX55/FX65: I increments during load/store
+- CPUState dataclass: V[0..15], I, PC, SP, stack[16], DT, ST
+- step() returns trace dict: {pc, opcode, mnemonic, writes}
+- Seeded RNG for reproducible random (CXNN instruction)
+- Waiting-for-key state for FX0A (blocks until key pressed)
+
+emulator/tracer.py
+------------------
+- format_trace_line(): Converts trace dict to string:
+  [PC:0200] [FETCH:6005] [OP:LD_VX_NN] [W_V0:05] [W_PC:0202]
+- format_mem_snapshot(): <MEM_START> <0200:60> ... <MEM_END> (skips 0x000-0x1FF)
+- format_reg_snapshot(): <REG_START> <V0:00> ... <PC:0200> ... <REG_END>
+- generate_trace(): Runs CPU for N cycles, produces list of trace lines
+
+===============================================================================
+PHASE 2: Custom Tokenizer
+===============================================================================
+
+data/tokenizer.py
+-----------------
+- NOT BPE. Every concept is one discrete token.
+- Vocabulary (370 tokens total):
+  - <PAD>: Padding token (ID 0)
+  - <00>-<FF>: 256 hex byte tokens
+  - <V0>-<VF>: 16 register name tokens
+  - <PC>, <I>, <DT>, <ST>, <SP>: Special register tokens
+  - <PC:>, <FETCH:>, <OP:>: Trace label tokens
+  - <W_V0>-<W_VF>, <W_I>, <W_PC>, <W_DT>, <W_ST>, <W_SP>, <W_MEM:>,
+    <W_DISPLAY>: Write label tokens
+  - 34 opcode mnemonics: <CLS>, <RET>, <JP_ADDR>, <LD_VX_NN>, etc.
+  - Control tokens: <MEM_START>, <MEM_END>, <REG_START>, <REG_END>,
+    <TRACE_START>, <SEP>, <ADDR:>, <VAL:>
+  - Keypad tokens: <KEY_0>-<KEY_F>, <KEY_UP>, <KEY_DOWN>, etc., <NO_KEY>
+  - Structural: [, ], :
+
+- encode_line(): Parses bracket notation [PC:0200] and angle brackets
+  <0200:60> into flat token ID lists
+- decode(): Token IDs back to string
+- encode_trace(): Encodes full list of trace lines into flat token IDs
+
+===============================================================================
+PHASE 3: Data Generation
+===============================================================================
+
+data/generator.py
+-----------------
+- 33 opcode generator functions, each producing 2-byte CHIP-8 instructions
+- Weighted random opcode selection (LD_VX_NN and DRW weighted higher)
+- generate_random_rom(): Creates ROMs with N random valid instructions
+- generate_traces_from_rom(): Runs ROM through emulator, captures traces
+- generate_dataset(): Mixed dataset from random ROMs (fuzzing) + real ROMs
+  from a directory. Each ROM trace separated by <SEP> token.
+- Real ROM loading via load_rom_file()
+
+data/dataset.py
+---------------
+- TraceDataset: PyTorch Dataset
+- Takes flat token ID list, creates sliding windows of seq_len+1
+- X = tokens[0:seq_len], Y = tokens[1:seq_len+1] (next-token prediction)
+- Pads short sequences with pad_id
+
+===============================================================================
+PHASE 4: Model Architecture
+===============================================================================
+
+model/config.py
+---------------
+- ModelConfig dataclass:
+  - vocab_size=370, d_model=256, n_heads=128, d_head=2
+  - n_layers=6, d_ff=1024, max_seq_len=512, dropout=0.1
+  - use_checkpoint=True (gradient checkpointing for memory savings)
+  - temp_start=10.0, temp_end=0.01 (temperature annealing range)
+- detect_device(): Returns cuda > mps > cpu
+- for_device(): Auto-selects seq_len, checkpoint enabled on all devices:
+  - CUDA 24GB+: seq_len=1024, checkpoint
+  - CUDA <24GB: seq_len=1024, checkpoint
+  - MPS: seq_len=512, checkpoint
+  - CPU: seq_len=256, checkpoint
+
+model/attention.py
+------------------
+- Attention2D: Core 2D attention module
+  - 128 heads, each with d_head=2 (2D key/query/value vectors)
+  - W_q, W_k, W_v: Linear(d_model → d_model) projections
+  - W_o: Output projection
+  - Causal mask (upper triangular)
+
+  forward() routes to three paths based on device and mode:
+
+  1. CUDA fast path (_cuda_attention):
+     - Full parallel: single matmul over all 128 heads
+     - (B, 128, T, T) score matrix — fits in 24GB+ VRAM
+     - Uses F.scaled_dot_product_attention (Flash Attention) when available
+     - Falls back to manual softmax for temperature != 1.0
+
+  2. CUDA hardmax path (_cuda_hardmax):
+     - Full parallel argmax over all heads
+
+  3. MPS/CPU chunked path (_chunked_softmax):
+     - Processes heads in chunks (dynamic chunk size based on B, T)
+     - Each chunk: reshape to (B*chunk, T, d_head), use bmm
+     - Peak memory: B * chunk_size * T * T * 4 bytes
+     - Pre-allocated output tensor, writes each chunk directly
+
+  4. MPS/CPU hardmax path (_chunked_hardmax):
+     - Same chunked strategy but with argmax
+
+  forward_step(): Single-token autoregressive step with KV-cache
+    - Q, K, V for new token, append to cache
+    - Full parallel (seq_len=1 at inference is always cheap)
+
+  ~5M total parameters (weight-tied embeddings)
+
+model/transformer.py
+--------------------
+- TransformerBlock:
+  - Pre-norm: LayerNorm → Attention → residual → LayerNorm → FFN → residual
+  - FFN: Linear(256→1024) → GELU → Linear(1024→256) → Dropout
+  - forward_step() for autoregressive generation
+
+- Chip8Transformer:
+  - token_emb: Embedding(vocab_size, d_model)
+  - pos_emb: Embedding(max_seq_len, d_model)
+  - 6 TransformerBlocks
+  - ln_f: Final LayerNorm
+  - head: Linear(d_model, vocab_size) — weight-tied with token_emb
+  - Gradient checkpointing via torch.utils.checkpoint during training
+
+  generate():
+  - Prefill: processes entire prompt, builds KV cache per layer
+  - Autoregressive: one token at a time with KV cache
+  - Greedy decoding (argmax)
+
+model/hardmax.py
+----------------
+- hardmax_attention_step(): Single query, find nearest key by dot product
+- hardmax_attention_full(): Full sequence hardmax with causal mask
+
+===============================================================================
+PHASE 5: Convex Hull KV-Cache
+===============================================================================
+
+hull/kv_cache.py
+----------------
+- ConvexHullKVCache:
+  - Stores raw K, V tensors (list of per-step tensors)
+  - Per-head 2D point lists and scipy ConvexHull
+  - append(): Adds new K/V, rebuilds hull for each of 128 heads
+  - query_hardmax(): Queries only hull vertices (O(V) where V << N)
+  - Hull reduction: 20 points → 5-8 vertices typical for random 2D data
+
+- StandardKVCache: Baseline cache that queries all keys (O(N))
+
+Key insight: For 2D vectors, the maximum dot product Q·K occurs at a vertex
+of the convex hull of the key points. This reduces attention from O(N) to
+O(V) where V is hull vertex count.
+
+===============================================================================
+PHASE 6: Training
+===============================================================================
+
+train.py
+--------
+- Auto device detection: CUDA > MPS > CPU
+- CUDA info: prints GPU name and VRAM
+- Data pipeline: generate → tokenize → dataset → train/val split
+
+- Temperature annealing (exponential decay):
+  τ(step) = temp_start * (temp_end / temp_start) ^ (step / total_steps)
+  Starts at 10.0 (soft, near-uniform attention)
+  Ends at 0.01 (sharp, near-argmax → prepares for hardmax inference)
+
+- Mixed precision (CUDA only):
+  - torch.autocast with bfloat16
+  - GradScaler (no-op for bf16, active for fp16)
+  - Auto-disabled on MPS/CPU
+
+- torch.compile (CUDA only):
+  - Applied when CUDA detected
+  - 20-40% speedup, skipped if unavailable
+
+- Gradient checkpointing:
+  - Enabled on all devices (CUDA, MPS, CPU)
+  - Essential for long sequences (seq_len >= 1024) to avoid OOM
+  - Can be disabled with --no-checkpoint
+
+- Optimizer: AdamW (lr=1e-4, weight_decay=0.01)
+- Scheduler: Linear warmup + cosine decay
+- Gradient clipping: max_norm=1.0
+- Cross-entropy loss ignoring pad tokens
+- Progress bars via tqdm: shows loss, acc, temp, lr, step per batch
+- Checkpointing:
+  - Saves best model (by val_loss)
+  - Step-based checkpoints every --save-every-steps (default 100)
+  - Epoch-based checkpoints every --save-every epochs (default 5)
+  - All checkpoints include model, optimizer, scheduler, epoch, global_step, best_val_loss
+  - Resume from any checkpoint with --resume <path> or --resume latest
+
+CLI arguments:
+  --device, --cpu           Device selection
+  --num-roms (500)          Random ROMs for fuzzing
+  --inst-per-rom (64)       Instructions per ROM
+  --cycles-per-rom (2000)   Execution cycles per ROM
+  --seq-len (512)           Sequence length (use 2048 for long context)
+  --d-model (256)           Model dimension
+  --n-heads (128)           Number of attention heads
+  --n-layers (6)            Transformer layers
+  --d-ff (1024)             FFN dimension
+  --batch-size (8)          Batch size
+  --lr (1e-4)               Learning rate
+  --epochs (20)             Training epochs
+  --temp-start (10.0)       Initial temperature
+  --temp-end (0.01)         Final temperature
+  --no-amp                  Disable mixed precision
+  --no-compile              Disable torch.compile
+  --no-checkpoint           Disable gradient checkpointing
+  --output-dir (checkpoints) Checkpoint directory
+  --save-every-steps (100)  Save checkpoint every N steps (0 to disable)
+  --save-every (5)          Save checkpoint every N epochs
+  --resume                  Path to checkpoint or 'latest' to auto-find
+
+===============================================================================
+PHASE 7: Game Runner
+===============================================================================
+
+generate.py
+------------
+- Loads trained model from checkpoint
+- Loads ROM (.ch8 file) or generates random ROM
+- Builds initial prompt from memory snapshot + register state + <TRACE_START>
+- Autoregressive generation with hardmax attention
+
+- Headless mode:
+  - Generates trace tokens, prints decoded output
+
+- Display mode (pygame):
+  - 64×32 display scaled 10× (640×320 window)
+  - Standard CHIP-8 keypad mapping (1-4, QWER, ASDF, ZXCV)
+  - Keypad input injected as <KEY_X> tokens
+  - Parses generated tokens for display updates
+  - Token buffer trimmed to last 2048 tokens to prevent unbounded growth
+  - 60 FPS target, ~10 cycles per frame (~600 Hz)
+
+===============================================================================
+DEVICE-SPECIFIC BEHAVIOR
+===============================================================================
+
+MPS (Apple Silicon, ~9GB unified memory):
+  - Attention: Chunked heads via bmm (dynamic chunk size)
+  - Gradient checkpointing: Enabled (recomputes forward activations)
+  - Default seq_len: 512
+  - Default batch_size: 8
+  - Precision: float32
+  - No torch.compile
+
+CUDA (24-48GB VRAM):
+  - Attention: Full parallel across all 128 heads
+  - Flash Attention via F.scaled_dot_product_attention (auto)
+  - Gradient checkpointing: Enabled (critical for seq_len >= 1024)
+  - Default seq_len: 1024
+  - Default batch_size: 32+
+  - Precision: bfloat16 mixed precision
+  - torch.compile enabled
+
+CPU:
+  - Attention: Same chunked path as MPS
+  - Gradient checkpointing: Enabled
+  - Default seq_len: 256
+  - Default batch_size: 4-8
+  - Precision: float32
+  - Very slow, mainly for debugging
+
+===============================================================================
+TRAINING RESULTS (MPS, tiny test)
+===============================================================================
+
+Config: d_model=64, n_heads=32, d_head=2, n_layers=2, seq_len=128, 98K params
+Dataset: 50 random ROMs, 500 cycles each, ~358K tokens
+
+Epoch 1: loss=2.26, acc=54.89%
+Epoch 2: loss=0.91, acc=71.04%
+Epoch 3: loss=0.80, acc=74.78%
+
+Temperature annealing visible in logs: 10.0 → 0.01 over training.
+Accuracy rises as temperature drops (attention sharpens toward hardmax).
+
+===============================================================================
+DEPENDENCIES
+===============================================================================
+
+torch>=2.0          # Core framework
+numpy               # Array operations
+scipy               # ConvexHull for KV-cache optimization
+pygame>=2.5         # Display/keyboard for game runner
+tqdm                # Progress bars for training
+
+===============================================================================
+USAGE
+===============================================================================
+
+# Train on MPS (Mac)
+python3 train.py --num-roms 500 --epochs 20 --batch-size 8
+
+# Train on CUDA
+python3 train.py --num-roms 500 --epochs 20 --batch-size 32 --seq-len 1024
+
+# Train on CUDA with long context (2048 tokens)
+python3 train.py --num-roms 500 --epochs 20 --batch-size 8 --seq-len 2048
+
+# Resume training from latest checkpoint
+python3 train.py --resume latest --seq-len 2048 --batch-size 8
+
+# Resume from specific checkpoint
+python3 train.py --resume checkpoints/checkpoint_step500.pt
+
+# Quick test
+python3 train.py --num-roms 50 --epochs 3 --d-model 64 --n-heads 32 --n-layers 2
+
+# Run trained model (headless)
+python3 generate.py checkpoints/best_model.pt --random-rom --headless
+
+# Run with display
+python3 generate.py checkpoints/best_model.pt --rom game.ch8
+
+===============================================================================
+FILES CREATED
+===============================================================================
+
+emulator/__init__.py      (empty)
+emulator/memory.py        (57 lines)
+emulator/display.py       (42 lines)
+emulator/keypad.py        (21 lines)
+emulator/cpu.py           (245 lines)
+emulator/tracer.py        (79 lines)
+data/__init__.py          (empty)
+data/tokenizer.py         (167 lines)
+data/generator.py         (175 lines)
+data/dataset.py           (39 lines)
+model/__init__.py         (empty)
+model/config.py           (62 lines)
+model/attention.py        (220 lines)
+model/transformer.py      (202 lines)
+model/hardmax.py          (53 lines)
+hull/__init__.py          (empty)
+hull/kv_cache.py          (122 lines)
+train.py                  (378 lines)
+generate.py               (210 lines)
+pyproject.toml            (13 lines)
+requirements.txt          (5 lines)
+.gitignore                (9 lines)
+</file>
+
+<file path="model/attention.py">
+"""2D attention with temperature annealing and Rotary Position Embeddings (RoPE)."""
+
+from __future__ import annotations
+
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def apply_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    """Applies Rotary Position Embedding to 2D query and key vectors."""
+    q_0, q_1 = q[..., 0:1], q[..., 1:2]
+    k_0, k_1 = k[..., 0:1], k[..., 1:2]
+    
+    # 2D Rotation Matrix
+    q_out_0 = q_0 * cos - q_1 * sin
+    q_out_1 = q_0 * sin + q_1 * cos
+    q_out = torch.cat([q_out_0, q_out_1], dim=-1)
+    
+    k_out_0 = k_0 * cos - k_1 * sin
+    k_out_1 = k_0 * sin + k_1 * cos
+    k_out = torch.cat([k_out_0, k_out_1], dim=-1)
+    
+    return q_out, k_out
+
+
+class Attention2D(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, d_head: int,
+                 max_seq_len: int, dropout: float = 0.1):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.d_model = d_model
+        self.scale = math.sqrt(d_head)
+
+        self.W_q = nn.Linear(d_model, d_model, bias=False)
+        self.W_k = nn.Linear(d_model, d_model, bias=False)
+        self.W_v = nn.Linear(d_model, d_model, bias=False)
+        self.W_o = nn.Linear(d_model, d_model, bias=False)
+
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
+
+        self.register_buffer(
+            "causal_mask",
+            torch.triu(torch.ones(max_seq_len, max_seq_len), diagonal=1).bool()
+        )
+
+        # --- CUSTOM 2D RoPE PRE-COMPUTATION ---
+        # Since d_head=2, we distribute the frequencies across the heads!
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, n_heads, dtype=torch.float32) / n_heads))
+        self.register_buffer("inv_freq", inv_freq)
+        
+        t = torch.arange(max_seq_len, dtype=torch.float32)
+        freqs = torch.outer(inv_freq, t)  # (n_heads, max_seq_len)
+        self.register_buffer("cos_cached", freqs.cos().unsqueeze(0).unsqueeze(-1)) # (1, n_heads, T, 1)
+        self.register_buffer("sin_cached", freqs.sin().unsqueeze(0).unsqueeze(-1)) # (1, n_heads, T, 1)
+
+    def _get_cos_sin(self, start_pos: int, seq_len: int, device: torch.device):
+        if start_pos + seq_len <= self.cos_cached.shape[2]:
+            return (self.cos_cached[:, :, start_pos:start_pos+seq_len, :],
+                    self.sin_cached[:, :, start_pos:start_pos+seq_len, :])
+        
+        # Fallback for dynamic extended generation
+        t = torch.arange(start_pos, start_pos + seq_len, dtype=torch.float32, device=device)
+        freqs = torch.outer(self.inv_freq, t)
+        cos = freqs.cos().unsqueeze(0).unsqueeze(-1)
+        sin = freqs.sin().unsqueeze(0).unsqueeze(-1)
+        return cos, sin
+
+    def forward(self, x: torch.Tensor, temperature: float = 1.0,
+                use_hardmax: bool = False, start_pos: int = 0) -> torch.Tensor:
+        B, T, _ = x.shape
+
+        Q = self.W_q(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        K = self.W_k(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        V = self.W_v(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+
+        # Apply RoPE
+        cos, sin = self._get_cos_sin(start_pos, T, Q.device)
+        Q, K = apply_rope(Q, K, cos, sin)
+
+        mask = self.causal_mask[:T, :T]
+        is_cuda = x.device.type == "cuda"
+
+        if is_cuda and not use_hardmax:
+            out = self._cuda_attention(Q, K, V, T, temperature)
+        elif use_hardmax:
+            if is_cuda:
+                out = self._cuda_hardmax(Q, K, V, T)
+            else:
+                out = self._chunked_hardmax(Q, K, V, T, B, mask)
+        else:
+            out = self._chunked_softmax(Q, K, V, T, B, mask, temperature)
+
+        out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
+        out = self.W_o(out)
+        out = self.resid_dropout(out)
+        return out
+
+
+    def _cuda_attention(self, Q: torch.Tensor, K: torch.Tensor,
+                        V: torch.Tensor, T: int,
+                        temperature: float) -> torch.Tensor:
+        """Full parallel attention on CUDA using Flash Attention."""
+        
+        pad_size = 16 - self.d_head
+        scale_correction = math.sqrt(16) / (self.scale * temperature)
+        Q_scaled = Q * scale_correction
+        
+        # Pad from 2D to 16D with zeros.
+        Q_pad = F.pad(Q_scaled, (0, pad_size))
+        K_pad = F.pad(K, (0, pad_size))
+        V_pad = F.pad(V, (0, pad_size))
+        
+        # Call Flash Attention directly (No try/except block so torch.compile doesn't allocate fallback memory!)
+        out_pad = F.scaled_dot_product_attention(
+            Q_pad, K_pad, V_pad,
+            attn_mask=None,
+            dropout_p=self.attn_dropout.p if self.training else 0.0,
+            is_causal=True,
+        )
+        
+        # Slice the 14 zeros off the end to return perfectly to d_head=2
+        return out_pad[..., :self.d_head]
+
+    def _cuda_hardmax(self, Q: torch.Tensor, K: torch.Tensor,
+                      V: torch.Tensor, T: int) -> torch.Tensor:
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+        mask_expanded = self.causal_mask[:T, :T].unsqueeze(0).unsqueeze(0)
+        scores = scores.masked_fill(mask_expanded, float("-inf"))
+        idx = scores.argmax(dim=-1)
+        idx_expanded = idx.unsqueeze(-1).expand(-1, -1, -1, self.d_head)
+        return torch.gather(V, dim=2, index=idx_expanded)
+
+    def _chunked_softmax(self, Q: torch.Tensor, K: torch.Tensor,
+                         V: torch.Tensor, T: int, B: int,
+                         mask: torch.Tensor,
+                         temperature: float) -> torch.Tensor:
+        out = torch.empty(B, self.n_heads, T, self.d_head,
+                          device=Q.device, dtype=Q.dtype)
+
+        chunk_size = min(self.n_heads, max(1, 32 * 512 * 512 // (B * T * T)))
+        chunk_size = max(1, min(chunk_size, self.n_heads))
+
+        for start in range(0, self.n_heads, chunk_size):
+            end = min(start + chunk_size, self.n_heads)
+            Qc = Q[:, start:end, :, :]
+            Kc = K[:, start:end, :, :]
+            Vc = V[:, start:end, :, :]
+
+            nc = end - start
+            Qr = Qc.reshape(B * nc, T, self.d_head)
+            Kr = Kc.reshape(B * nc, T, self.d_head)
+            Vr = Vc.reshape(B * nc, T, self.d_head)
+
+            scores = torch.bmm(Qr, Kr.transpose(1, 2)) / self.scale
+            scores = scores / temperature
+            scores = scores.masked_fill(mask, float("-inf"))
+            attn_weights = F.softmax(scores, dim=-1)
+            attn_weights = self.attn_dropout(attn_weights)
+            chunk_out = torch.bmm(attn_weights, Vr)
+
+            out[:, start:end, :, :] = chunk_out.reshape(B, nc, T, self.d_head)
+
+        return out
+
+    def _chunked_hardmax(self, Q: torch.Tensor, K: torch.Tensor,
+                         V: torch.Tensor, T: int, B: int,
+                         mask: torch.Tensor) -> torch.Tensor:
+        out = torch.empty(B, self.n_heads, T, self.d_head,
+                          device=Q.device, dtype=Q.dtype)
+
+        chunk_size = min(self.n_heads, max(1, 32 * 512 * 512 // (B * T * T)))
+        chunk_size = max(1, min(chunk_size, self.n_heads))
+
+        for start in range(0, self.n_heads, chunk_size):
+            end = min(start + chunk_size, self.n_heads)
+            nc = end - start
+
+            Qr = Q[:, start:end, :, :].reshape(B * nc, T, self.d_head)
+            Kr = K[:, start:end, :, :].reshape(B * nc, T, self.d_head)
+            Vr = V[:, start:end, :, :].reshape(B * nc, T, self.d_head)
+
+            scores = torch.bmm(Qr, Kr.transpose(1, 2)) / self.scale
+            scores = scores.masked_fill(mask, float("-inf"))
+            idx = scores.argmax(dim=-1)
+            idx_exp = idx.unsqueeze(-1).expand(-1, -1, self.d_head)
+            chunk_out = torch.gather(Vr, dim=1, index=idx_exp)
+
+            out[:, start:end, :, :] = chunk_out.reshape(B, nc, T, self.d_head)
+
+        return out
+
+    def forward_step(self, x: torch.Tensor, kv_cache: tuple | None = None,
+                     temperature: float = 1.0,
+                     use_hardmax: bool = False, seq_pos: int = 0) -> tuple[torch.Tensor, tuple]:
+        B = x.shape[0]
+
+        Q = self.W_q(x).view(B, 1, self.n_heads, self.d_head).transpose(1, 2)
+        K_new = self.W_k(x).view(B, 1, self.n_heads, self.d_head).transpose(1, 2)
+        V_new = self.W_v(x).view(B, 1, self.n_heads, self.d_head).transpose(1, 2)
+
+        # Apply RoPE to the new K and Q
+        cos, sin = self._get_cos_sin(seq_pos, 1, Q.device)
+        Q, K_new = apply_rope(Q, K_new, cos, sin)
+
+        if kv_cache is not None:
+            K_cache, V_cache = kv_cache
+            K = torch.cat([K_cache, K_new], dim=2)
+            V = torch.cat([V_cache, V_new], dim=2)
+        else:
+            K = K_new
+            V = V_new
+
+        if use_hardmax:
+            scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+            idx = scores.argmax(dim=-1)
+            idx_expanded = idx.unsqueeze(-1).expand(-1, -1, -1, self.d_head)
+            out = torch.gather(V, dim=2, index=idx_expanded)
+        else:
+            scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+            scores = scores / temperature
+            attn_weights = F.softmax(scores, dim=-1)
+            out = torch.matmul(attn_weights, V)
+
+        out = out.transpose(1, 2).contiguous().view(B, 1, self.d_model)
+        out = self.W_o(out)
+
+        return out, (K, V)
+</file>
+
+<file path="train.py">
+"""Training script for CHIP-8 transformer with temperature annealing.
+
+Supports CUDA (mixed precision, torch.compile, full parallel attention),
+MPS (gradient checkpointing, chunked attention), and CPU.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import time
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, random_split
+from tqdm import tqdm
+
+from data.tokenizer import Tokenizer
+from data.generator import generate_dataset
+from data.dataset import TraceDataset
+from model.config import ModelConfig
+from model.transformer import Chip8Transformer
+
+
+
+
+def get_temperature(step: int, total_steps: int, temp_start: float,
+                    temp_end: float) -> float:
+    """Reach temp_end at 75% of training, then stay there."""
+    cooldown_step = int(total_steps * 0.75)
+    if step >= cooldown_step:
+        return temp_end
+
+    ratio = step / cooldown_step
+    return temp_start * (temp_end / temp_start) ** ratio
+
+def get_device(args) -> torch.device:
+    if args.cpu:
+        return torch.device("cpu")
+    if args.device:
+        return torch.device(args.device)
+    return ModelConfig.detect_device()
+
+
+def train(args):
+    device = get_device(args)
+    is_cuda = device.type == "cuda"
+    use_amp = is_cuda and not args.no_amp
+    amp_dtype = torch.bfloat16 if is_cuda else torch.float32
+
+    print(f"Device: {device}")
+    if is_cuda:
+        gpu_name = torch.cuda.get_device_properties(0).name
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"GPU: {gpu_name} ({vram_gb:.0f} GB)")
+    print(f"Mixed precision: {use_amp} (dtype={amp_dtype})")
+
+    # 1. Generate data
+    print("\nGenerating training data...")
+    t0 = time.time()
+    rom_dir = args.rom_dir if args.rom_dir else None
+    trace_lines = generate_dataset(
+        num_random_roms=args.num_roms,
+        instructions_per_rom=args.inst_per_rom,
+        cycles_per_rom=args.cycles_per_rom,
+        rom_dir=rom_dir,
+        seed=args.seed,
+    )
+    print(f"Generated {len(trace_lines)} trace lines in {time.time()-t0:.1f}s")
+
+    # 2. Tokenize
+    print("Tokenizing...")
+    tokenizer = Tokenizer()
+    print(f"Vocab size: {tokenizer.vocab_size}")
+
+    token_ids = tokenizer.encode_trace(trace_lines)
+    print(f"Total tokens: {len(token_ids):,}")
+
+    # 3. Dataset
+    seq_len = args.seq_len
+    dataset = TraceDataset(token_ids, seq_len=seq_len,
+                           pad_id=tokenizer.pad_id)
+
+    val_size = max(1, int(len(dataset) * 0.05))
+    train_size = len(dataset) - val_size
+    train_ds, val_ds = random_split(dataset, [train_size, val_size],
+                                    generator=torch.Generator().manual_seed(args.seed))
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                              shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size,
+                            shuffle=False, num_workers=0)
+    print(f"Train samples: {train_size}, Val samples: {val_size}")
+
+    # 4. Model
+    config = ModelConfig(
+        vocab_size=tokenizer.vocab_size,
+        d_model=args.d_model,
+        n_heads=args.n_heads,
+        d_head=args.d_model // args.n_heads,
+        n_layers=args.n_layers,
+        d_ff=args.d_ff,
+        max_seq_len=seq_len,
+        dropout=args.dropout,
+        pad_token_id=tokenizer.pad_id,
+        use_checkpoint=args.checkpoint,
+        temp_start=args.temp_start,
+        temp_end=args.temp_end,
+    )
+    model = Chip8Transformer(config).to(device)
+
+    # torch.compile on CUDA (PyTorch 2.x)
+    if is_cuda and not args.no_compile:
+        try:
+            model = torch.compile(model)
+            print("torch.compile: enabled")
+        except Exception as e:
+            print(f"torch.compile: skipped ({e})")
+
+    print(f"Parameters: {model.count_parameters():,}")
+    print(f"Gradient checkpointing: {config.use_checkpoint}")
+
+    # 5. Optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                                   weight_decay=args.weight_decay)
+
+    # Learning rate schedule: warmup + cosine decay
+    total_steps = len(train_loader) * args.epochs
+    warmup_steps = args.warmup_steps
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(warmup_steps, 1)
+        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        return 0.5 * (1 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # Mixed precision scaler (not needed for bfloat16, but for safety)
+    scaler = torch.amp.GradScaler(enabled=use_amp and amp_dtype == torch.float16)
+
+    # 6. Resume from checkpoint
+    global_step = 0
+    start_epoch = 0
+    best_val_loss = float("inf")
+
+    if args.resume:
+        ckpt_path = args.resume
+        if ckpt_path == "latest":
+            step_ckpts = sorted(Path(args.output_dir).glob("checkpoint_step*.pt"))
+            if step_ckpts:
+                ckpt_path = str(step_ckpts[-1])
+            else:
+                ckpt_path = os.path.join(args.output_dir, "final_model.pt")
+
+        if os.path.exists(ckpt_path):
+            checkpoint = torch.load(ckpt_path, map_location=device)
+            model.load_state_dict(checkpoint["model_state_dict"])
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            if "scheduler_state_dict" in checkpoint:
+                scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            start_epoch = checkpoint.get("epoch", 0)
+            global_step = checkpoint.get("global_step", 0)
+            best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+            print(f"Resumed from {ckpt_path} (epoch {start_epoch}, step {global_step})")
+        else:
+            print(f"Checkpoint not found: {ckpt_path}, starting fresh")
+
+    # 7. Training loop
+    loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_id)
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    for epoch in range(start_epoch, args.epochs):
+        model.train()
+        epoch_loss = 0
+        epoch_correct = 0
+        epoch_total = 0
+
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}",
+                    leave=True, dynamic_ncols=True)
+        t_epoch = time.time()
+        for batch_idx, (x, y) in enumerate(pbar):
+            x, y = x.to(device), y.to(device)
+
+            # Current temperature
+            temp = get_temperature(global_step, total_steps,
+                                   config.temp_start, config.temp_end)
+
+            optimizer.zero_grad()
+
+            # Mixed precision forward
+            with torch.autocast(device_type=device.type,
+                                dtype=amp_dtype, enabled=use_amp):
+                temp_tensor = torch.tensor(temp, device=device, dtype=torch.float32)
+                logits = model(x, temperature=temp_tensor)
+                loss = loss_fn(logits.view(-1, config.vocab_size), y.view(-1))
+
+            # Backward (with scaler for fp16, no-op for bf16)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+
+            # Accuracy (non-pad tokens)
+            preds = logits.argmax(dim=-1)
+            mask = y != tokenizer.pad_id
+            correct = ((preds == y) & mask).sum().item()
+            total = mask.sum().item()
+
+            epoch_loss += loss.item()
+            epoch_correct += correct
+            epoch_total += total
+            global_step += 1
+
+            # Update progress bar
+            lr = optimizer.param_groups[0]["lr"]
+            acc = correct / max(total, 1) * 100
+            pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.1f}%",
+                             temp=f"{temp:.3f}", lr=f"{lr:.1e}",
+                             step=global_step)
+
+            # Step-based checkpoint
+            if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
+                pbar.write(f"  Saved checkpoint at step {global_step}")
+                save_path = os.path.join(args.output_dir, f"checkpoint_step{global_step}.pt")
+                torch.save({
+                    "config": config,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "best_val_loss": best_val_loss,
+                }, save_path)
+
+        train_loss = epoch_loss / len(train_loader)
+        train_acc = epoch_correct / max(epoch_total, 1) * 100
+
+        # Validation
+        model.eval()
+        val_loss = 0
+        val_correct = 0
+        val_total = 0
+        with torch.no_grad():
+            with torch.autocast(device_type=device.type,
+                                dtype=amp_dtype, enabled=use_amp):
+                for x, y in tqdm(val_loader, desc="  Validating",
+                                 leave=False, dynamic_ncols=True):
+                    x, y = x.to(device), y.to(device)
+                    logits = model(x, temperature=config.temp_end)
+                    loss = loss_fn(logits.view(-1, config.vocab_size), y.view(-1))
+                    preds = logits.argmax(dim=-1)
+                    mask = y != tokenizer.pad_id
+                    val_correct += ((preds == y) & mask).sum().item()
+                    val_total += mask.sum().item()
+                    val_loss += loss.item()
+
+        val_loss /= max(len(val_loader), 1)
+        val_acc = val_correct / max(val_total, 1) * 100
+
+        elapsed = time.time() - t_epoch
+        samples_per_sec = (train_size * seq_len) / elapsed
+        print(f"Epoch {epoch+1}/{args.epochs} ({elapsed:.1f}s, "
+              f"{samples_per_sec:,.0f} tok/s) | "
+              f"train_loss={train_loss:.4f} train_acc={train_acc:.2f}% | "
+              f"val_loss={val_loss:.4f} val_acc={val_acc:.2f}%")
+
+        # Save best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            save_path = os.path.join(args.output_dir, "best_model.pt")
+            torch.save({
+                "config": config,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "epoch": epoch,
+                "global_step": global_step,
+                "val_loss": val_loss,
+                "val_acc": val_acc,
+            }, save_path)
+            print(f"  Saved best model (val_loss={val_loss:.4f})")
+
+        # Periodic checkpoint
+        if (epoch + 1) % args.save_every == 0:
+            save_path = os.path.join(args.output_dir, f"checkpoint_epoch{epoch+1}.pt")
+            torch.save({
+                "config": config,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "epoch": epoch,
+                "global_step": global_step,
+                "best_val_loss": best_val_loss,
+            }, save_path)
+
+    # Save final model
+    save_path = os.path.join(args.output_dir, "final_model.pt")
+    torch.save({
+        "config": config,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "epoch": args.epochs,
+        "global_step": global_step,
+        "best_val_loss": best_val_loss,
+    }, save_path)
+    print(f"\nTraining complete. Best val_loss={best_val_loss:.4f}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train CHIP-8 Transformer")
+
+    # Device
+    parser.add_argument("--device", type=str, default=None,
+                        help="Force device (e.g., cuda, mps, cpu)")
+    parser.add_argument("--cpu", action="store_true",
+                        help="Force CPU")
+
+    # Data
+    parser.add_argument("--num-roms", type=int, default=500)
+    parser.add_argument("--inst-per-rom", type=int, default=64)
+    parser.add_argument("--cycles-per-rom", type=int, default=2000)
+    parser.add_argument("--rom-dir", type=str, default=None)
+    parser.add_argument("--seq-len", type=int, default=512)
+    parser.add_argument("--seed", type=int, default=42)
+
+    # Model
+    parser.add_argument("--d-model", type=int, default=256)
+    parser.add_argument("--n-heads", type=int, default=128)
+    parser.add_argument("--n-layers", type=int, default=6)
+    parser.add_argument("--d-ff", type=int, default=1024)
+    parser.add_argument("--dropout", type=float, default=0.1)
+
+    # Training
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--warmup-steps", type=int, default=500)
+
+    # Temperature
+    parser.add_argument("--temp-start", type=float, default=10.0)
+    parser.add_argument("--temp-end", type=float, default=0.01)
+
+    # CUDA optimizations (auto-disabled on MPS/CPU)
+    parser.add_argument("--no-amp", action="store_true",
+                        help="Disable mixed precision")
+    parser.add_argument("--no-compile", action="store_true",
+                        help="Disable torch.compile")
+    parser.add_argument("--no-checkpoint", action="store_true",
+                        help="Disable gradient checkpointing")
+
+    # Output
+    parser.add_argument("--output-dir", type=str, default="checkpoints")
+    parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument("--save-every", type=int, default=5)
+    parser.add_argument("--save-every-steps", type=int, default=100,
+                        help="Save checkpoint every N steps (0 to disable)")
+
+    # Resume
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint to resume from, or 'latest' to auto-find")
+
+    args = parser.parse_args()
+
+    # Auto-set checkpoint flag
+    if args.no_checkpoint:
+        args.checkpoint = False
+    else:
+        args.checkpoint = True
+
+    train(args)
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+</files>

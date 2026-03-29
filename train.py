@@ -14,7 +14,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from data.tokenizer import Tokenizer
@@ -57,42 +57,58 @@ def train(args):
         print(f"GPU: {gpu_name} ({vram_gb:.0f} GB)")
     print(f"Mixed precision: {use_amp} (dtype={amp_dtype})")
 
-    # 1. Generate data
+    # 1. Generate data — per-ROM traces for proper train/val splitting
     print("\nGenerating training data...")
     t0 = time.time()
     rom_dir = args.rom_dir if args.rom_dir else None
-    trace_lines = generate_dataset(
+    rom_traces = generate_dataset(
         num_random_roms=args.num_roms,
         instructions_per_rom=args.inst_per_rom,
         cycles_per_rom=args.cycles_per_rom,
         rom_dir=rom_dir,
         seed=args.seed,
+        per_rom=True,
     )
-    print(f"Generated {len(trace_lines)} trace lines in {time.time()-t0:.1f}s")
+    total_lines = sum(len(t) for t in rom_traces)
+    print(f"Generated {len(rom_traces)} ROM traces, {total_lines:,} total lines in {time.time()-t0:.1f}s")
 
     # 2. Tokenize
     print("Tokenizing...")
     tokenizer = Tokenizer()
     print(f"Vocab size: {tokenizer.vocab_size}")
 
-    token_ids = tokenizer.encode_trace(trace_lines)
-    print(f"Total tokens: {len(token_ids):,}")
+    # Tokenize each ROM trace separately (for ROM-level split)
+    rom_token_lists = []
+    for trace in rom_traces:
+        rom_token_lists.append(tokenizer.encode_trace(trace))
+    total_tokens = sum(len(t) for t in rom_token_lists)
+    print(f"Total tokens: {total_tokens:,}")
 
-    # 3. Dataset
+    # 3. ROM-level train/val split — no leakage between splits
+    import random as _random
+    _random.Random(args.seed).shuffle(rom_token_lists)
+
+    val_rom_count = max(1, int(len(rom_token_lists) * 0.05))
+    train_rom_tokens = [tok for rom in rom_token_lists[val_rom_count:] for tok in rom]
+    val_rom_tokens = [tok for rom in rom_token_lists[:val_rom_count] for tok in rom]
+
+    print(f"Train ROMs: {len(rom_token_lists) - val_rom_count}, Val ROMs: {val_rom_count}")
+    print(f"Train tokens: {len(train_rom_tokens):,}, Val tokens: {len(val_rom_tokens):,}")
+
+    # 4. Datasets — overlapping windows for train, non-overlapping for val
     seq_len = args.seq_len
-    dataset = TraceDataset(token_ids, seq_len=seq_len,
-                           pad_id=tokenizer.pad_id)
-
-    val_size = max(1, int(len(dataset) * 0.05))
-    train_size = len(dataset) - val_size
-    train_ds, val_ds = random_split(dataset, [train_size, val_size],
-                                    generator=torch.Generator().manual_seed(args.seed))
+    train_ds = TraceDataset(train_rom_tokens, seq_len=seq_len,
+                            stride=max(1, seq_len // 4),  # 75% overlap
+                            pad_id=tokenizer.pad_id)
+    val_ds = TraceDataset(val_rom_tokens, seq_len=seq_len,
+                          stride=seq_len,  # no overlap for honest eval
+                          pad_id=tokenizer.pad_id)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size,
                               shuffle=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size,
                             shuffle=False, num_workers=0)
-    print(f"Train samples: {train_size}, Val samples: {val_size}")
+    print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
 
     # 4. Model
     config = ModelConfig(
@@ -263,7 +279,7 @@ def train(args):
         val_acc = val_correct / max(val_total, 1) * 100
 
         elapsed = time.time() - t_epoch
-        samples_per_sec = (train_size * seq_len) / elapsed
+        samples_per_sec = (len(train_ds) * seq_len) / elapsed
         print(f"Epoch {epoch+1}/{args.epochs} ({elapsed:.1f}s, "
               f"{samples_per_sec:,.0f} tok/s) | "
               f"train_loss={train_loss:.4f} train_acc={train_acc:.2f}% | "

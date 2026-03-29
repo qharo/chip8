@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
 from .cpu import CPU
+
+
+# Max entries in a memory snapshot to keep token count manageable
+MAX_MEM_SNAPSHOT_ENTRIES = 100
 
 
 def format_trace_line(trace: dict) -> str:
@@ -42,11 +48,19 @@ def format_trace_line(trace: dict) -> str:
     return " ".join(parts)
 
 
-def format_mem_snapshot(memory) -> str:
-    """Format memory non-zero bytes as token string."""
-    snapshot = memory.snapshot()
-    entries = " ".join(f"<{addr:04X}:{val:02X}>" for addr, val in snapshot)
-    return f"<MEM_START> {entries} <MEM_END>"
+def format_mem_snapshot(memory, written_addrs: set[int] | None = None) -> str:
+    """Format memory non-zero bytes as token string.
+
+    If written_addrs is provided, only snapshot those addresses (capped).
+    Otherwise fall back to full non-zero snapshot from start_addr onward.
+    """
+    if written_addrs:
+        entries = [(a, memory.read_byte(a)) for a in sorted(written_addrs)]
+    else:
+        entries = memory.snapshot()
+    entries = entries[:MAX_MEM_SNAPSHOT_ENTRIES]
+    parts = " ".join(f"<{addr:04X}:{val:02X}>" for addr, val in entries)
+    return f"<MEM_START> {parts} <MEM_END>"
 
 
 def format_reg_snapshot(state) -> str:
@@ -63,13 +77,15 @@ def format_reg_snapshot(state) -> str:
 
 
 def generate_trace(cpu: CPU, max_cycles: int = 10000,
-                   snapshot_interval: int = 0) -> list[str]:
+                   snapshot_interval: int = 0,
+                   key_event_fn: Callable | None = None) -> list[str]:
     """Run CPU and produce list of trace lines.
 
     Args:
         cpu: Running CPU instance
         max_cycles: Maximum cycles to execute
         snapshot_interval: If > 0, re-inject state snapshot every N cycles
+        key_event_fn: Optional callback(cycle_lines, all_lines, cycle) to inject key events
 
     Returns:
         List of token strings (trace lines and optional snapshots)
@@ -79,7 +95,17 @@ def generate_trace(cpu: CPU, max_cycles: int = 10000,
     lines.append(format_reg_snapshot(cpu.state))
     lines.append("<TRACE_START>")
 
+    # Track which memory addresses have been written to (for trimmed snapshots)
+    written_addrs: set[int] = set()
+
     for cycle in range(max_cycles):
+        # Tick timers at ~60Hz (every cycle in emulation time)
+        cpu.tick_timers()
+
+        # Inject keyboard events before stepping
+        if key_event_fn is not None:
+            key_event_fn(lines, cycle)
+
         trace = cpu.step()
 
         if trace.get("halted"):
@@ -88,11 +114,21 @@ def generate_trace(cpu: CPU, max_cycles: int = 10000,
         if trace.get("waiting_for_key"):
             continue
 
+        # Track memory writes for trimmed snapshots
+        for write_type, write_val in trace["writes"]:
+            if write_type == "W_MEM":
+                # write_val format: "03F:AB" (addr:byte)
+                addr_str = write_val.split(":")[0]
+                written_addrs.add(int(addr_str, 16))
+
         line = format_trace_line(trace)
         if line:
             lines.append(line)
 
         if snapshot_interval > 0 and (cycle + 1) % snapshot_interval == 0:
             lines.append(format_reg_snapshot(cpu.state))
+            # Periodic trimmed memory snapshot
+            if written_addrs:
+                lines.append(format_mem_snapshot(cpu.memory, written_addrs))
 
     return lines
