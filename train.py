@@ -98,7 +98,7 @@ def train(args):
     # 4. Datasets — overlapping windows for train, non-overlapping for val
     seq_len = args.seq_len
     train_ds = TraceDataset(train_rom_tokens, seq_len=seq_len,
-                            stride=max(1, seq_len // 4),  # 75% overlap
+                            stride=seq_len,  # 75% overlap
                             pad_id=tokenizer.pad_id)
     val_ds = TraceDataset(val_rom_tokens, seq_len=seq_len,
                           stride=seq_len,  # no overlap for honest eval

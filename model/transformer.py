@@ -72,7 +72,7 @@ class Chip8Transformer(nn.Module):
         self.ln_f = nn.LayerNorm(config.d_model)
         self.head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
-        self.head.weight = self.token_emb.weight
+        #self.head.weight = self.token_emb.weight
         self._init_weights()
 
     def _init_weights(self):
