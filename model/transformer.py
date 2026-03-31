@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 from .config import ModelConfig
-from .attention import Attention2D
+from .attention import Attention2D, apply_rope
 
 try:
     from torch.utils.checkpoint import checkpoint
@@ -72,7 +72,7 @@ class Chip8Transformer(nn.Module):
         self.ln_f = nn.LayerNorm(config.d_model)
         self.head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
-        #self.head.weight = self.token_emb.weight
+        self.head.weight = self.token_emb.weight
         self._init_weights()
 
     def _init_weights(self):

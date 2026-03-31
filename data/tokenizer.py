@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 
-def _build_vocab() -> tuple[dict[str, int], dict[int, str]]:
+def _build_vocab() -> tuple[dict[str, int], dict[int, str], list[str]]:
     tokens = []
     idx = 0
 
@@ -85,7 +85,7 @@ class Tokenizer:
 
     def __init__(self):
         self.token_to_id, self.id_to_token, self.vocab = _build_vocab()
-        self.vocab_size = len(self.vocab)
+        self.vocab_size: int = len(self.vocab)
         self.pad_id = self.token_to_id["<PAD>"]
 
     def encode_line(self, line: str) -> list[int]:
@@ -107,8 +107,8 @@ class Tokenizer:
             # Handle angle-bracket tokens like <MEM_START>, <0200:60>, <V0:00>
             elif part.startswith("<") and part.endswith(">"):
                 inner = part[1:-1]
-                # Check if it's a simple control token
-                if inner in self.token_to_id:
+                # Check if it's a simple control token (e.g. <MEM_START>, <TRACE_START>, <SEP>)
+                if part in self.token_to_id:
                     ids.append(self.token_to_id[part])
                 else:
                     # It's a value token like <0200:60> or <V0:00>
